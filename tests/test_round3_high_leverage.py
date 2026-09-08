@@ -112,10 +112,11 @@ def test_d198_rank_building_area_top1() -> None:
     assert parsed.order_col == "A18"
 
 
-def test_제2종_평균_uses_d198_in_covered_dong() -> None:
+def test_제2종_평균_uses_usage_on_covered_dong() -> None:
     q = "남산동 제2종근린생활시설의 평균 높이를 알려줘"
     plan = try_heuristic_plan(q)
     assert plan is not None
     assert plan.query_kind == "aggregate"
-    assert "d198_ledger" in (plan.assumptions or [])
     assert any(f.field == "usage" and f.value == "제2종근린생활시설" for f in plan.filters)
+    # Covered dong + main usage → D198 A25 (MAIN485 grain contract).
+    assert "d198_ledger" in (plan.assumptions or [])

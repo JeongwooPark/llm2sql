@@ -74,8 +74,9 @@ USAGE_COUNT = RouteCapability(
 )
 STRUCTURE_COUNT = RouteCapability(
     route="building_structure_count",
+    supports_multiple_predicates=True,
     supported_aggregations=_COUNT_ONLY,
-    supported_fields=_PLACE_FIELDS | {"structure"},
+    supported_fields=_PLACE_FIELDS | {"structure", "violation_status", "usage"},
 )
 SPECIAL_LAND_COUNT = RouteCapability(
     route="building_special_land_count",
@@ -148,8 +149,15 @@ INDUSTRIAL = RouteCapability(
     route="industrial",
     entities=frozenset({"industrial_complex", "building"}),
     supports_spatial=True,
-    supported_aggregations=_COUNT_ONLY,
-    supported_fields=_PLACE_FIELDS | {"usage"},
+    supports_group_by=True,
+    supported_group_fields=frozenset({"name", "industrial_complex", "sigungu_name"}),
+    supports_rank=True,
+    supports_top_n=True,
+    supports_output_projection=True,
+    supported_aggregations=_BASIC_AGGS,
+    supported_fields=_PLACE_FIELDS
+    | _THRESHOLD_FIELDS
+    | {"usage", "name", "area_m2", "gross_floor_area_m2"},
 )
 INDUSTRIAL_ADMIN_GROUP = RouteCapability(
     route="industrial_admin_sig_group",
@@ -199,6 +207,7 @@ D198 = RouteCapability(
         "approval_date",
         "permit_date",
         "ledger_kind",
+        "complex_building_kind",
     }
     | _PLACE_FIELDS,
 )
@@ -269,10 +278,25 @@ def capability_for(route: str) -> RouteCapability:
         return RANK
     if intent == "building_name_lookup":
         return NAME_LOOKUP
+    if intent == "bas_admin_overlap":
+        return SPATIAL
+    if intent == "industrial_count_by_sigungu":
+        return INDUSTRIAL_ADMIN_GROUP
     if intent == "industrial_admin_sig_group":
         return INDUSTRIAL_ADMIN_GROUP
     if intent.startswith("industrial_") or intent == "buildings_in_industrial":
         return INDUSTRIAL
+    if intent == "dual_gu_approval_year_median":
+        return PLAN_ROUTE
+    if intent == "sigungu_site_avg_vs_city" or intent == "sigungu_avg_ground_floors":
+        return RouteCapability(
+            route=intent,
+            supports_group_by=True,
+            supported_group_fields=frozenset({"sigungu_name"}),
+            supported_aggregations=_BASIC_AGGS,
+            supports_output_projection=True,
+            supported_fields=_THRESHOLD_FIELDS | _PLACE_FIELDS,
+        )
     if intent.startswith("d198_") or intent.startswith("building_age"):
         return D198
     if intent.startswith("d010_attr") or intent.startswith("d010_"):

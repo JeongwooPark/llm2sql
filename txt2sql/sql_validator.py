@@ -36,6 +36,20 @@ def diagnose_sql(question: str, sql: str, *, row_count: int | None = None) -> st
         or "주요용도" in q
         or looks_like_age_question(q)
     )
+    if not d198_ok:
+        from txt2sql.domain import (
+            extract_detail_usages,
+            extract_usage,
+            extract_usage_classes,
+        )
+        from txt2sql.dataset_grain import place_has_d198_coverage
+
+        d198_ok = bool(
+            extract_usage(q)
+            or extract_usage_classes(q)
+            or extract_detail_usages(q)
+            or place_has_d198_coverage(q)
+        )
     gu_in_q = bool(re.search(r"[가-힣]{1,6}구", q))
     busan_wide = any(
         k in q for k in ("부산시", "부산광역시", "부산 전체", "부산내", "부산 내")
@@ -198,10 +212,13 @@ def diagnose_sql(question: str, sql: str, *, row_count: int | None = None) -> st
 
     # 산업단지 도형 자체 질의는 D060 필수. 건물·공장∩산단은 JOIN이면 통과.
     if "산업단지" in q and "AL_D060" not in upper:
-        buildingish = any(
-            k in q for k in ("건물", "공장", "창고", "채", "용도", "이름")
+        name_list = any(k in q for k in ("이름", "명칭", "목록", "리스트")) and not any(
+            k in q for k in ("건물", "건축물", "공장", "창고")
         )
-        if not buildingish:
+        buildingish = any(
+            k in q for k in ("건물", "공장", "창고", "채", "용도")
+        ) and not name_list
+        if name_list or not buildingish:
             reasons.append('Industrial-park questions must use "AL_D060_00_20250804".')
         elif "ST_INTERSECTS" not in upper:
             reasons.append(
@@ -242,7 +259,12 @@ def diagnose_sql(question: str, sql: str, *, row_count: int | None = None) -> st
         reasons.append(
             "Query returned 0 rows with AL_D198 only; retry with AL_D010 and A4 LIKE gu filter."
         )
-    if row_count == 0 and gu_m and d198_table_for_gu(gu_m.group(1)) is None and uses_d198:
+    if (
+        row_count == 0
+        and gu_name
+        and d198_table_for_gu(gu_name) is None
+        and uses_d198
+    ):
         reasons.append(
             "Query returned 0 rows on AL_D198 for a gu without D198 coverage; "
             'rewrite with "AL_D010" and "A9" for usage filters.'

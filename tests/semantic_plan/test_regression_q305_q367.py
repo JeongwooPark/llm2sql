@@ -19,9 +19,10 @@ def test_rel_years_use_reference_date_in_sql() -> None:
 def test_q305_q306_q313_gold_counts() -> None:
     settings = load_settings()
     cases = [
-        ("장전동에서 최근 10년 내 준공된 건물은 몇 채야?", 184),
-        ("사직동에서 준공된 지 30년 이상 된 건물 수를 알려줘", 2537),
-        ("서동에서 40년 이상 된 건물 수를 알려줘", 2856),
+        # D198 커버 픽스처 + frozen reference_date(2026-08-27) 기준.
+        ("장전동에서 최근 10년 내 준공된 건물은 몇 채야?", 183),
+        ("사직동에서 준공된 지 30년 이상 된 건물 수를 알려줘", 2533),
+        ("서동에서 40년 이상 된 건물 수를 알려줘", 2838),
     ]
     with connect(settings.database_url) as conn:
         for q, gold in cases:

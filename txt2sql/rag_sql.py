@@ -92,6 +92,8 @@ def run_rag_sql(
             logical_plan_snapshot=logical_plan_snapshot,
             binding_snapshot=binding_snapshot,
         )
+    from txt2sql.security.llm_policy import allow_sample_values_for_llm
+
     host = _llm_host(settings, ollama_client)
     _emit(progress, "schema", "스키마 검색(임베딩 RAG)")
     retrieved = retrieve_schema(
@@ -101,7 +103,7 @@ def run_rag_sql(
         host=host,
         client=ollama_client,
         top_k=settings.schema_top_k,
-        include_sample_values=settings.include_sample_values,
+        include_sample_values=allow_sample_values_for_llm(settings),
     )
     tables = retrieved.get("tables") or []
     _emit(

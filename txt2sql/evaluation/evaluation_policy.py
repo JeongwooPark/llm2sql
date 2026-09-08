@@ -78,8 +78,28 @@ def _as_int(value: float) -> int | None:
 
 
 def parse_numbers(text: str) -> list[float]:
-    out: list[float] = []
-    for m in NUM_RE.findall(text or ""):
+    """Extract floats.
+
+    Prefer key=value RHS only for metric-style aliases (p25=, resi_h=, var_area=).
+    Group golds like ``gu=…, n=1,288`` keep full NUM_RE so rank indices still match.
+    """
+    text = text or ""
+    metric_kv = re.findall(
+        r"(?:p\d+|pctl\w*|percentile\w*|var_\w*|resi_\w*|com_\w*|ind_\w*|"
+        r"avg_\w*|sum_\w*|min_\w*|max_\w*|median_\w*|std\w*|diff|ratio\w*|pct\w*)"
+        r"\s*=\s*(-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+\.\d+|-?\d+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if metric_kv:
+        out: list[float] = []
+        for m in metric_kv:
+            v = _to_float(m)
+            if v is not None:
+                out.append(v)
+        return out
+    out = []
+    for m in NUM_RE.findall(text):
         v = _to_float(m)
         if v is not None:
             out.append(v)
@@ -87,7 +107,13 @@ def parse_numbers(text: str) -> list[float]:
 
 
 def _detect_scope(text: str) -> str | None:
-    for token in re.findall(r"[\w가-힣]+(?:구|군|동|시|도)", text or ""):
+    raw = text or ""
+    for m in re.finditer(r"[\w가-힣]+(?:구|군|동|시|도)", raw):
+        token = m.group(0)
+        end = m.end()
+        # 「기초구역」 안의 '기초구' 오탐 방지
+        if token.endswith("구") and end < len(raw) and raw[end] == "역":
+            continue
         if len(token) >= 2:
             return token
     return None
@@ -97,7 +123,28 @@ def _detect_unit(text: str, *, metric: str) -> str | None:
     t = text or ""
     if metric in {"count", "count_distinct"}:
         return "count"
-    if "pct" in t.lower() or "%" in t or "비율" in t or "퍼센트" in t:
+    # 면적 집계·분위수·분산: 질문의 「25%」는 비율 단위가 아님
+    areaish = (
+        "면적" in t
+        or "연면적" in t
+        or "㎡" in t
+        or "m2" in t.lower()
+        or "gfa" in t.lower()
+        or "var_area" in t.lower()
+        or re.search(r"\bp\d+\s*=", t.lower()) is not None
+    )
+    if metric in {"area", "avg", "sum", "min", "max", "std", "median", "scalar_float"} and areaish:
+        if not any(k in t for k in ("비율", "퍼센트", "몇%", "몇 프로")):
+            return "m2"
+    # pctl/percentile 별칭에 포함된 'pct' 부분문자열 오탐 방지
+    if re.search(r"(?<![a-z])pct(?![a-z_])", t.lower()) or re.search(
+        r"(?<!\d)%", t
+    ) or "비율" in t or "퍼센트" in t:
+        if "%" in t and not any(k in t for k in ("비율", "퍼센트", "몇%", "pct")):
+            if areaish or "분위" in t or "pctl" in t.lower() or "percentile" in t.lower():
+                return "m2" if areaish or "분위" in t or "pctl" in t.lower() else None
+        if "pctl" in t.lower() or "percentile" in t.lower():
+            return "m2" if areaish or metric == "area" else None
         return "pct"
     if "㎡" in t or "m2" in t.lower() or "연면적" in t or "면적" in t:
         return "m2"
@@ -113,12 +160,21 @@ def _metric_from_gold_text(gold: str) -> str | None:
     g = (gold or "").lower()
     if re.search(r"\bsum_", g):
         return "sum"
+    # max_h/min_h 는 rank 답변(scalar_float)과 맞추고, 면적 min/max만 엄격 metric
+    if re.search(r"\bmin_(?:area|building)", g):
+        return "min"
+    if re.search(r"\bmax_(?:area|building)", g):
+        return "max"
     if re.search(r"\bmedian_", g):
         return "median"
     if re.search(r"\bstd_", g):
         return "std"
     if re.search(r"\bavg_", g):
         return "avg"
+    if re.search(r"\bcorr_", g):
+        return "corr"
+    if re.search(r"\bvar_", g) or re.search(r"\bp\d+\b", g) or "pctl" in g:
+        return "area"
     if re.search(r"_ratio\b", g):
         return "ratio"
     if re.search(r"\bpct\b", g) or g.strip().startswith("pct"):
@@ -132,9 +188,28 @@ def _unit_from_gold_text(gold: str, *, metric: str) -> str | None:
     g = (gold or "").lower()
     if metric == "ratio" or re.search(r"\bpct\b", g) or re.search(r"_ratio\b", g):
         return "pct" if "%" in gold or re.search(r"\bpct\b", g) else None
-    if "avg_h" in g or "median_h" in g or "std_h" in g or "height" in g or "높이" in g:
+    if (
+        "avg_h" in g
+        or "median_h" in g
+        or "std_h" in g
+        or "max_h" in g
+        or "min_h" in g
+        or "height" in g
+        or "높이" in g
+    ):
         return "m"
-    if "avg_gfa" in g or "sum_gfa" in g or "gfa" in g or "연면적" in g:
+    if (
+        "avg_gfa" in g
+        or "sum_gfa" in g
+        or "gfa" in g
+        or "연면적" in g
+        or "min_area" in g
+        or "max_area" in g
+        or "avg_area" in g
+        or "sum_area" in g
+        or "sum_ar" in g
+        or re.search(r"\b(?:min|max|avg|sum)_.*area", g)
+    ):
         return "m2"
     if metric in {"count", "count_distinct"}:
         return "count"
@@ -143,13 +218,23 @@ def _unit_from_gold_text(gold: str, *, metric: str) -> str | None:
 
 def _metric_from_answer_text(answer: str) -> str | None:
     a = (answer or "").lower()
-    if re.search(r"sum_(?:gross_floor_area|gfa)", a):
+    if re.search(r"\bcorr_", a) or "상관계수" in (answer or ""):
+        return "corr"
+    if re.search(r"\bsum_", a):
         return "sum"
-    if re.search(r"median_(?:height|h)", a):
+    if re.search(r"\bmin_(?:area|building)", a):
+        return "min"
+    if re.search(r"\bmax_(?:area|building)", a):
+        return "max"
+    if "variance_" in a or re.search(r"\bvar_(?:area|building)", a):
+        return "area"
+    if "percentile_" in a or "pctl_" in a:
+        return "area"
+    if re.search(r"median_(?:height|h|days)", a):
         return "median"
-    if re.search(r"std(?:dev)?_(?:height|h)", a):
+    if re.search(r"std(?:dev)?_(?:height|h|days)", a):
         return "std"
-    if re.search(r"avg_(?:height|gross_floor_area|building)", a):
+    if re.search(r"avg_(?:height|gross_floor_area|building|age|area|ground)", a):
         return "avg"
     if "ratio_pct" in a or re.search(r"\bpct\b", a):
         return "ratio"
@@ -164,7 +249,22 @@ def _unit_from_answer_text(answer: str, *, metric: str) -> str | None:
         return "pct"
     if any(tok in a for tok in ("avg_height", "median_height", "std_height", "height_m")):
         return "m"
-    if any(tok in a for tok in ("sum_gross_floor_area", "avg_gross_floor_area", "gfa")):
+    if any(
+        tok in a
+        for tok in (
+            "sum_gross_floor_area",
+            "avg_gross_floor_area",
+            "gfa",
+            "variance_",
+            "percentile_",
+            "building_area",
+            "area_m2",
+            "min_building_area",
+            "min_area",
+            "sum_area",
+            "avg_area",
+        )
+    ):
         return "m2"
     return _detect_unit(answer, metric=metric)
 
@@ -178,7 +278,11 @@ def _metric_from_sql(sql: str | None, *, kind: str) -> str | None:
     # Scalar answers often SELECT avg(...) and count(*) together — prefer aggregate intent.
     if kind == "scalar":
         for token, metric in (
-            ("PERCENTILE", "median"),
+            ("CORR(", "corr"),
+            ("VAR_POP", "area"),
+            ("VARIANCE", "area"),
+            ("VAR_SAMP", "area"),
+            ("PERCENTILE", "area"),
             ("STDDEV", "std"),
             ("AVG(", "avg"),
             ("SUM(", "sum"),
@@ -189,7 +293,23 @@ def _metric_from_sql(sql: str | None, *, kind: str) -> str | None:
                 return metric
         if "RATIO" in upper or " AS \"RATIO_PCT\"" in upper:
             return "ratio"
-    if kind == "count" or "COUNT(" in upper:
+    if kind == "count" or (
+        "COUNT(" in upper
+        and not any(
+            tok in upper
+            for tok in (
+                "CORR(",
+                "AVG(",
+                "SUM(",
+                "MIN(",
+                "MAX(",
+                "VAR_POP",
+                "VARIANCE",
+                "PERCENTILE",
+                "STDDEV",
+            )
+        )
+    ):
         return "count"
     if "AVG(" in upper:
         return "avg"
@@ -208,6 +328,8 @@ def _context_from_rows(
     grain: str | None = None
     if "avg_h" in keys or "avg_height_m" in keys or any(k.startswith("avg_") for k in keys):
         metric = "avg"
+    if any(k.startswith("corr_") for k in keys):
+        metric = "corr"
     if "legal_dong" in keys or "bjd" in keys:
         grain = "legal_dong"
     elif "admin_dong" in keys:
@@ -241,7 +363,9 @@ def infer_gold_context(*, kind: str, gold: str, question: str = "") -> SemanticE
         if "n=" in gold and "bjd=" in gold:
             metric = "avg" if "avg" in gold.lower() else "count"
             grain = "legal_dong"
-        if metric == "scalar_float":
+        if metric == "corr":
+            pass  # 상관계수: 질문의 「연면적」 등으로 area로 덮지 않음
+        elif metric == "scalar_float":
             if re.search(r"\bpct\b", gold.lower()) or gold.strip().lower().startswith("pct"):
                 metric = "ratio"
             elif "평균" in question or "avg" in gold.lower():
@@ -259,7 +383,9 @@ def infer_gold_context(*, kind: str, gold: str, question: str = "") -> SemanticE
         metric = kind
 
     unit = _unit_from_gold_text(gold, metric=metric) or _detect_unit(gold, metric=metric)
-    if unit is None and metric not in {"avg", "scalar_float"}:
+    if metric == "corr":
+        unit = None
+    elif unit is None and metric not in {"avg", "scalar_float"}:
         unit = _detect_unit(blob, metric=metric)
     scope: str | None = None
     bjd_m = re.search(r"bjd=([^;/]+)", gold)
@@ -329,7 +455,9 @@ def infer_pred_context(
 
     distinct = metric == "count_distinct"
     unit = _unit_from_answer_text(answer, metric=metric)
-    if unit is None:
+    if metric == "corr":
+        unit = None
+    elif unit is None:
         unit = _detect_unit(answer, metric=metric)
     if metric in {"count", "count_distinct"} and unit is None:
         unit = "count"
@@ -367,6 +495,11 @@ def contexts_align(gold: SemanticEvalContext, pred: SemanticEvalContext | None) 
         g_scope, p_scope = gold.scope, pred.scope
         if g_scope in p_scope or p_scope in g_scope:
             return True
+        # 답변 place prefix가 상위 구·군이고 gold는 동 단위인 경우
+        if g_scope.endswith(("동", "가", "리")) and p_scope.endswith(("구", "군", "시")):
+            return True
+        if p_scope.endswith(("동", "가", "리")) and g_scope.endswith(("구", "군", "시")):
+            return True
         if gold.grain in {"legal_dong", "admin_dong", "group"}:
             return True
         return False
@@ -390,7 +523,7 @@ def comparator_for_context(ctx: SemanticEvalContext) -> ComparatorSpec:
         return COMPARATOR_DEFAULTS["geometry"]
     if m == "avg":
         return COMPARATOR_DEFAULTS["scalar_float"]
-    if m in {"sum", "min", "max", "median", "std", "scalar_float"}:
+    if m in {"sum", "min", "max", "median", "std", "scalar_float", "corr"}:
         return COMPARATOR_DEFAULTS["scalar_float"]
     return COMPARATOR_DEFAULTS["scalar_float"]
 

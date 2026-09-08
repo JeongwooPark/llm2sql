@@ -43,6 +43,10 @@ _STOP = {
     "출력",
     "출력해",
     "출력해줘",
+    "출력하라",
+    "출력해라",
+    "보여라",
+    "보여줘라",
     "묶어",
     "묶어라",
     "묶어줘",
@@ -61,6 +65,36 @@ _STOP = {
     "조회하라",
     "조회해라",
     "나열",
+    "나열하라",
+    "나열해라",
+    "기간",
+    "소요",
+    "걸린",
+    "허가",
+    "준공",
+    "사용승인",
+    "긴",
+    "짧은",
+    "최장",
+    "순으로",
+    "양수",
+    "정상값",
+    "정상",
+    "레코드",
+    "최단",
+    "뽑아",
+    "뽑아라",
+    "추출하라",
+    "속성데이터",
+    "속성",
+    "표시하라",
+    "표시해라",
+    "표시해",
+    "표시해줘",
+    "차트로",
+    "그래프로",
+    "그려라",
+    "그려줘",
     "최근",
     "최근에",
     "말해",
@@ -135,6 +169,16 @@ _STOP = {
     "성격의",
     "구까지",
     "지하층",
+    "지상층",
+    "지상층수",
+    "층수",
+    "건축연령",
+    "상관계수",
+    "상관",
+    "일수",
+    "허가일",
+    "사용승인일",
+    "오래된",
     "건폐율",
     "용적율",
     "용적률",
@@ -238,6 +282,12 @@ _STOP = {
     "기초구역",
     "행정동",
     "법정동",
+    "겹치",
+    "겹치는",
+    "겹친",
+    "교차",
+    "교차하는",
+    "걸친",
     "용도",
     "지어진",
     "지어진지",
@@ -291,6 +341,33 @@ _STOP = {
     "싶어",
     "부탁",
     "부탁해",
+    "비율",
+    "비율을",
+    "비율이",
+    "백분율",
+    "백분율로",
+    "퍼센트",
+    "대비",
+    "전체",
+    "전체에서",
+    "계산",
+    "계산해",
+    "계산해줘",
+    "차이를",
+    "차이가",
+    "차이",
+    "구조별",
+    "법정동별",
+    "용도별",
+    "세부용도별",
+    "층수별",
+    "구별",
+    "나눠",
+    "나누어",
+    "건수와",
+    "건수를",
+    "평균을",
+    "보여",
 }
 
 # 측정 기준이 불명확한 형용사/감성어
@@ -318,6 +395,12 @@ _VAGUE = (
     "베스트",
     "최고야",
     "최고인",
+    "높은 건물",
+    "높은건물",
+    "큰 건물",
+    "큰건물",
+    "낮은 건물",
+    "작은 건물",
 )
 
 _USAGE_WORDS = tuple(
@@ -451,12 +534,75 @@ def check_ambiguity(
             continue
         filtered.append(v)
     vague_hits = filtered
+    # 임계·순위·필드 비교가 있으면 크기 형용사 soft vague 제외
+    # (「높은 건물 수는?」처럼 기준 없는 건수는 계속 clarify)
+    if vague_hits and any(
+        k in q
+        for k in (
+            "이상",
+            "이하",
+            "초과",
+            "미만",
+            "상위",
+            "가장",
+            "제일",
+            "㎡",
+            "m2",
+            "미터",
+            "보다 큰",
+            "보다 작",
+            "보다 높",
+            "보다 낮",
+            "연면적",
+            "대지면적",
+            "건축면적",
+            "건축물면적",
+            "용적률",
+            "용적율",
+            "건폐율",
+            "개",
+        )
+    ):
+        vague_hits = [
+            v
+            for v in vague_hits
+            if not any(x in v for x in ("높은", "큰", "낮은", "작은"))
+        ]
     if vague_hits:
         return ClarifyAnswer(
             intent="clarify_vague",
             ambiguous_terms=vague_hits,
             options=[],
             answer=_vague_guidance(q, vague_hits),
+        )
+
+    # 지역 없는 단순 목록·개수
+    if re.search(r"건물\s*\d+\s*개만", q) and not (extract_place(q) or extract_gu(q)):
+        return ClarifyAnswer(
+            intent="clarify_vague",
+            ambiguous_terms=["지역"],
+            options=[],
+            answer="확인이 필요합니다. 지역(구·동)이 없습니다. 어느 구·동의 건물을 볼지 알려 주세요.",
+        )
+
+    # 「기초구역 안 건물 보여줘」처럼 대상 구역·장소·집계 단서가 모두 없을 때만 확인
+    if (
+        "기초구역" in q
+        and "건물" in q
+        and not re.search(r"BAS[_ ]?ID|기초구역번호|기초구역\s*번호", q, re.I)
+        and not re.search(r"\d{5,}", q)
+        and not (extract_place(q) or extract_gu(q))
+        and not any(k in q for k in ("별", "겹치", "교차", "걸친", "분포", "건수", "채수", "몇"))
+        and any(k in q for k in ("보여", "찾아", "목록", "리스트"))
+    ):
+        return ClarifyAnswer(
+            intent="clarify_vague",
+            ambiguous_terms=["기초구역"],
+            options=[],
+            answer=(
+                "확인이 필요합니다. 기초구역번호(BAS_ID)가 없습니다. "
+                "어느 기초구역인지 번호나 구·동을 알려 주세요."
+            ),
         )
 
     from txt2sql.domain import is_vague_age_threshold
@@ -578,7 +724,9 @@ def check_ambiguity(
     unknown = _unknown_terms(q, place=place, gu=gu_name)
     # 차트 종류 변경/안내·지표 필터 질문은 미지 용어 clarify 대상이 아님
     from txt2sql.chart_qa import (
+        is_chart_accept_question,
         is_chart_capability_question,
+        is_chart_decline_question,
         is_chart_metric_draw_question,
         is_chart_series_filter_question,
         is_chart_type_change_question,
@@ -594,18 +742,38 @@ def check_ambiguity(
         looks_like_measure_threshold,
     )
     from txt2sql.guide_qa import _is_coverage_question
+    from txt2sql.named_dataset_qa import (
+        is_named_dataset_data_question,
+        named_dataset_display_tokens,
+        try_named_dataset_query,
+    )
+    from txt2sql.query_understanding.contract import extract_contract
 
+    contract = extract_contract(q)
+    # 업로드 표시명 데이터셋 조회는 미지용어 clarify 대상이 아님
+    if is_named_dataset_data_question(q) and try_named_dataset_query(conn, q) is not None:
+        unknown = []
+    else:
+        display_tokens = named_dataset_display_tokens(conn, q)
+        if display_tokens:
+            unknown = [u for u in unknown if u not in display_tokens]
     if (
         is_chart_type_change_question(q)
         or is_chart_capability_question(q)
         or is_chart_series_filter_question(q)
         or is_chart_metric_draw_question(q)
+        or is_chart_accept_question(q)
+        or is_chart_decline_question(q)
         or _is_coverage_question(q)
         or looks_like_building_name_lookup(q)
         or looks_like_measure_threshold(q)
         or looks_like_value_bin_question(q)
         or looks_like_year_stats_question(q)
         or has_anaphora(q)
+        or bool(contract.ratios)
+        or bool(contract.group_fields)
+        or contract.fixed_bins
+        or contract.operation in {"ratio", "aggregate", "group_rank"}
     ):
         unknown = []
     else:
@@ -671,6 +839,14 @@ def _vague_guidance(q: str, vague_hits: list[str]) -> str:
         usage_label = "건물"
 
     terms = ", ".join(vague_hits)
+    if any(k in terms for k in ("높은", "낮은", "큰", "작은")):
+        lines = [
+            f"확인이 필요합니다. 「{terms}」의 기준이 없습니다.",
+            "높이·연면적·대지면적 중 어떤 지표와 임계값(예: 높이 50m 이상, 연면적 1만㎡ 이상)인지 알려 주세요.",
+        ]
+        if not (place or extract_gu(q)):
+            lines.append("지역(구·동)도 함께 지정해 주시면 조회할 수 있습니다.")
+        return "\n".join(lines)
     lines = [
         f"「{terms}」은(는) 주관적인 표현이라 데이터만으로 ‘최고’를 정할 수 없습니다.",
         "어떤 기준이 ‘좋음’인지 알려 주시면 그 속성으로 순위·대표 건물을 찾아 드립니다.",

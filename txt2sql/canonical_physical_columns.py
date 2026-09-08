@@ -65,6 +65,8 @@ D198_FIELD_COLUMNS: dict[str, str] = {
     "permit_date": "A33",
     "detail_usage": "A27",
     "usage_class": "A29",
+    # 집합건물구분 (D198 A10). ledger_kind(A12 대장종류)와 구분.
+    "complex_building_kind": "A10",
     "ledger_kind": "A12",
     "building_age_years": "A34",
 }

@@ -18,7 +18,11 @@ MAX_PRED_NODES = 32
 def filter_to_predicate(spec: FilterSpec) -> PredicateSpec:
     left = OperandSpec(kind="field", field=spec.field)
     if spec.value_field:
-        right = OperandSpec(kind="field", field=spec.value_field)
+        right = OperandSpec(
+            kind="field",
+            field=spec.value_field,
+            scale=spec.value_scale,
+        )
         return PredicateSpec(op="cmp", operator=spec.operator, left=left, right=right)
     if spec.operator == "between":
         return PredicateSpec(

@@ -6,7 +6,13 @@ import re
 
 import psycopg
 
-from txt2sql.domain import AGE_HINTS, looks_like_age_question
+from txt2sql.domain import (
+    AGE_HINTS,
+    assumptions_include_permit_lag,
+    is_permit_approval_lag_question,
+    is_permit_lag_assumption,
+    looks_like_age_question,
+)
 from txt2sql.gazetteer import find_places, load_gazetteer
 from txt2sql.semantic_plan.catalog import get_entity, get_field
 from txt2sql.semantic_plan.models import (
@@ -78,58 +84,108 @@ def validate_semantic_plan(
     except UnknownSemanticFieldError as exc:
         return _fallback(plan, str(exc), score - 0.4)
 
-    if looks_like_age_question(question) or any(h in question for h in AGE_HINTS):
-        _age_fields = frozenset({"approval_date", "permit_date", "building_age_years"})
-        has_approval = any(item.field in _age_fields for item in plan.filters)
-        has_age_order = any(item.field in _age_fields for item in plan.order_by)
-        has_age_select = any(field in _age_fields for field in plan.select)
-        has_age_agg = any(
-            (item.field in _age_fields) or (item.alias or "").startswith(("avg_age", "age"))
-            for item in plan.aggregations
-        )
-        has_age_group = any(field in _age_fields for field in plan.group_by)
-        has_year_group = any(
-            k in question for k in ("구간별", "년대별", "연도별", "s~", "s～")
-        )
-        if not (
-            has_approval
-            or has_age_order
-            or has_age_select
-            or has_age_agg
-            or has_age_group
-            or has_year_group
-        ):
-            reason = (
-                "unsupported_coverage: 허가일은 D198만 지원"
-                if ("허가일" in question or "허가일자" in question)
-                and "사용승인" not in question
-                else "unsupported_coverage: building age / 사용승인"
+    if looks_like_age_question(question) or (
+        any(h in question for h in AGE_HINTS)
+        and not is_permit_approval_lag_question(question)
+    ):
+        from txt2sql.planner.semantic_executor import _parse_percentile_tail
+
+        tail = _parse_percentile_tail(question)
+        if tail is not None and tail[1] == "approval_date":
+            # 최근 준공 연도 꼬리 평균은 전용 SQL이 승인일을 rank에 사용
+            pass
+        elif assumptions_include_permit_lag(plan.assumptions):
+            # 허가↔승인 시차는 day-gap assumption으로 커버됨
+            pass
+        else:
+            _age_fields = frozenset({"approval_date", "permit_date", "building_age_years"})
+            has_approval = any(item.field in _age_fields for item in plan.filters)
+            has_age_order = any(item.field in _age_fields for item in plan.order_by)
+            has_age_select = any(field in _age_fields for field in plan.select)
+            has_age_agg = any(
+                (item.field in _age_fields)
+                or (item.alias or "").startswith(
+                    ("avg_age", "age", "median_days", "std_days", "corr_age")
+                )
+                or any(
+                    f in _age_fields for f in _expression_fields(item.expression)
+                )
+                for item in plan.aggregations
             )
-            return _fallback(plan, reason, score - 0.5)
+            has_age_group = any(field in _age_fields for field in plan.group_by)
+            has_year_group = any(
+                k in question for k in ("구간별", "년대별", "연도별", "s~", "s～")
+            )
+            from txt2sql.semantic_plan.predicate_utils import walk_predicate
+
+            def _pred_has_age(node) -> bool:
+                if node is None:
+                    return False
+                for leaf in walk_predicate(node):
+                    if leaf.left and leaf.left.field in _age_fields:
+                        return True
+                return False
+
+            has_age_ratio = any(
+                _pred_has_age(ratio.numerator_predicate)
+                or _pred_has_age(ratio.denominator_predicate)
+                for ratio in (plan.ratios or [])
+            )
+            if not (
+                has_approval
+                or has_age_order
+                or has_age_select
+                or has_age_agg
+                or has_age_group
+                or has_year_group
+                or has_age_ratio
+            ):
+                reason = (
+                    "unsupported_coverage: 허가일은 D198만 지원"
+                    if ("허가일" in question or "허가일자" in question)
+                    and "사용승인" not in question
+                    else "unsupported_coverage: building age / 사용승인"
+                )
+                return _fallback(plan, reason, score - 0.5)
 
     if (
         "면적" in question
         and "기초구역" not in question
+        and "산업단지" not in question
         and not any(
-            k in question for k in ("연면적", "건축면적", "건물면적", "대지면적")
+            k in question
+            for k in ("연면적", "건축물면적", "건축면적", "건물면적", "대지면적")
         )
     ):
-        area_fields = [f.field for f in plan.filters if "area" in f.field]
-        if not area_fields and not any("area" in s for s in plan.select):
-            clarified = plan.model_copy(
-                update={
-                    "requires_clarification": True,
-                    "ambiguities": list(plan.ambiguities)
-                    + ["면적이 건축면적·연면적·대지면적 중 어떤 것인지 필요합니다"],
-                }
-            )
-            return PlanValidationResult(
-                status="clarify",
-                score=score - 0.3,
-                errors=list(clarified.ambiguities),
-                warnings=warnings,
-                plan=clarified,
-            )
+        from txt2sql.place_area_qa import is_place_boundary_area_question
+
+        if not is_place_boundary_area_question(question):
+            area_fields = [f.field for f in plan.filters if "area" in f.field]
+            agg_areas = [
+                a.field
+                for a in (plan.aggregations or [])
+                if a.field and "area" in a.field
+            ]
+            if (
+                not area_fields
+                and not agg_areas
+                and not any("area" in s for s in plan.select)
+                and plan.entity not in {"industrial_complex", "basic_zone"}
+            ):
+                clarified = plan.model_copy(
+                    update={
+                        "requires_clarification": True,
+                        "ambiguities": list(plan.ambiguities)
+                        + ["면적이 건축면적·연면적·대지면적 중 어떤 것인지 필요합니다"],
+                    }
+                )
+                return PlanValidationResult(
+                    status="clarify",
+                    score=score - 0.3,
+                    errors=list(clarified.ambiguities),
+                    warnings=warnings,
+                    plan=clarified,
+                )
 
     agg_aliases = {item.alias for item in plan.aggregations if item.alias}
     ratio_aliases = {item.alias for item in plan.ratios if item.alias}
@@ -164,7 +220,7 @@ def validate_semantic_plan(
                 score - 0.4,
             )
         if spec.operator in {"gt", "gte", "lt", "lte", "between"} and field.data_type != "number":
-            if spec.field != "approval_date":
+            if spec.field not in {"approval_date", "permit_date"}:
                 return _fallback(
                     plan, f"numeric operator on text field: {spec.field}", score - 0.4
                 )
@@ -307,7 +363,17 @@ def validate_semantic_plan(
     tracked = [
         item
         for item in plan.assumptions
-        if item not in {"heuristic_plan", "plan_followup_delta", "plan_followup_event"}
+        if item
+        not in {
+            "heuristic_plan",
+            "plan_followup_delta",
+            "plan_followup_event",
+            "d198_ledger",
+        }
+        and not item.startswith("edge_bins:")
+        # Deterministic day-gap / list-order assumptions are not quality debt.
+        and not is_permit_lag_assumption(item)
+        and not item.startswith("group_by_industrial_name")
     ]
     if tracked:
         score -= 0.1 * min(len(tracked), 3)

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from txt2sql.config import Settings
@@ -27,7 +28,15 @@ from txt2sql.map.publish import (
     fetch_layer_attributes,
     is_safe_layer_name,
     is_safe_session_id,
+    layer_owner_session,
 )
+from txt2sql.observability import mask_text
+from txt2sql.security.auth import AuthContext
+from txt2sql.security import ensure_admin, ensure_user
+from txt2sql.security.http import http_from_public
+from txt2sql.security.errors import PublicError, UserInputError, correlation_id
+
+logger = logging.getLogger(__name__)
 
 
 class LayerAttributesRequest(BaseModel):
@@ -43,6 +52,10 @@ class LayerLabelsRequest(BaseModel):
 
 class SessionCleanupRequest(BaseModel):
     session_id: str = Field(..., min_length=8, max_length=64)
+
+
+class LayerDeleteRequest(BaseModel):
+    session_id: str | None = Field(None, min_length=8, max_length=64)
 
 
 # 업로드 공간테이블은 열이 수십 개일 수 있다. 거절(422)하지 않고 앞부분만 쓴다.
@@ -136,21 +149,74 @@ class ChoroplethResetRequest(BaseModel):
     style_name: str | None = Field(None, max_length=80)
 
 
-def _choropleth_http(exc: Exception) -> HTTPException:
+def _choropleth_http(exc: Exception, *, corr: str) -> HTTPException:
     if isinstance(exc, ChoroplethError):
-        return HTTPException(status_code=400, detail=str(exc))
-    return HTTPException(status_code=500, detail="단계구분도 처리 중 오류가 발생했습니다.")
+        return HTTPException(
+            status_code=400,
+            detail={
+                "detail": str(exc),
+                "code": "choropleth_error",
+                "correlation_id": corr,
+            },
+        )
+    logger.exception("choropleth error corr=%s err=%s", corr, mask_text(str(exc)))
+    return HTTPException(
+        status_code=500,
+        detail={
+            "detail": f"단계구분도 처리 중 오류가 발생했습니다. (참조: {corr})",
+            "code": "internal_error",
+            "correlation_id": corr,
+        },
+    )
+
+
+def _safe_http(exc: Exception, *, corr: str, fallback: str) -> HTTPException:
+    if isinstance(exc, PublicError):
+        return HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "detail": exc.message,
+                "code": exc.code,
+                "correlation_id": corr,
+            },
+        )
+    if isinstance(exc, ValueError):
+        return HTTPException(
+            status_code=400,
+            detail={"detail": str(exc), "code": "bad_request", "correlation_id": corr},
+        )
+    logger.exception("map api error corr=%s err=%s", corr, mask_text(str(exc)))
+    return HTTPException(
+        status_code=500,
+        detail={
+            "detail": f"{fallback} (참조: {corr})",
+            "code": "internal_error",
+            "correlation_id": corr,
+        },
+    )
 
 
 def create_map_router(
     get_settings: Callable[[], Settings],
     *,
     get_ollama: Callable[[], Any] | None = None,
+    get_auth: Callable[..., Any] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/map", tags=["map"])
 
+    def _auth_dep():
+        if get_auth is None:
+            async def _anon() -> AuthContext:
+                return AuthContext(role="admin", subject="local", via="loopback")
+
+            return _anon
+        return get_auth
+
+    auth_dep = _auth_dep()
+
     @router.get("/status")
-    def map_status() -> dict[str, Any]:
+    def map_status(auth: AuthContext = Depends(auth_dep)) -> dict[str, Any]:
+        ensure_user(auth)
         settings = get_settings()
         if not settings.geoserver_url:
             return {
@@ -172,7 +238,8 @@ def create_map_router(
         }
 
     @router.get("/layers")
-    def map_layers() -> dict[str, Any]:
+    def map_layers(auth: AuthContext = Depends(auth_dep)) -> dict[str, Any]:
+        ensure_user(auth)
         settings = get_settings()
         client = GeoServerClient(settings)
         if not client.enabled or not client.check():
@@ -181,9 +248,16 @@ def create_map_router(
         return {"layers": layers, "online": True}
 
     @router.get("/labels")
-    def map_labels(layer: str, columns: str | None = None) -> dict[str, Any]:
+    def map_labels(
+        layer: str,
+        request: Request,
+        columns: str | None = None,
+        auth: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        ensure_user(auth)
+        corr = getattr(request.state, "correlation_id", None) or correlation_id()
         if not layer.strip():
-            raise HTTPException(status_code=400, detail="레이어가 필요합니다.")
+            raise http_from_public(UserInputError("레이어가 필요합니다."))
         col_list = None
         if columns:
             col_list = [c for c in columns.split(",") if c.strip()]
@@ -192,11 +266,17 @@ def create_map_router(
                 get_settings(), layer.strip(), columns=col_list
             )
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            raise _safe_http(exc, corr=corr, fallback="라벨을 조회하지 못했습니다.") from exc
         return {"ok": True, **data}
 
     @router.post("/labels")
-    def map_labels_post(body: LayerLabelsRequest) -> dict[str, Any]:
+    def map_labels_post(
+        body: LayerLabelsRequest,
+        request: Request,
+        auth: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        ensure_user(auth)
+        corr = getattr(request.state, "correlation_id", None) or correlation_id()
         try:
             data = labels_for_layer(
                 get_settings(),
@@ -204,11 +284,17 @@ def create_map_router(
                 columns=body.columns,
             )
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            raise _safe_http(exc, corr=corr, fallback="라벨을 조회하지 못했습니다.") from exc
         return {"ok": True, **data}
 
     @router.post("/attributes")
-    def map_attributes(body: LayerAttributesRequest) -> dict[str, Any]:
+    def map_attributes(
+        body: LayerAttributesRequest,
+        request: Request,
+        auth: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        ensure_user(auth)
+        corr = getattr(request.state, "correlation_id", None) or correlation_id()
         try:
             data = fetch_layer_attributes(
                 get_settings(),
@@ -216,14 +302,18 @@ def create_map_router(
                 limit=body.limit,
                 offset=body.offset,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            raise _safe_http(exc, corr=corr, fallback="속성을 조회하지 못했습니다.") from exc
         return {"ok": True, **data}
 
     @router.post("/explain")
-    def map_explain(body: ExplainRequest) -> dict[str, Any]:
+    def map_explain(
+        body: ExplainRequest,
+        request: Request,
+        auth: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        ensure_user(auth)
+        corr = getattr(request.state, "correlation_id", None) or correlation_id()
         settings = get_settings()
         client = None
         if get_ollama is not None:
@@ -245,78 +335,140 @@ def create_map_router(
                 client=client,
             )
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            raise _safe_http(exc, corr=corr, fallback="설명을 만들지 못했습니다.") from exc
         return {"ok": True, **data}
 
     @router.delete("/layer/{name}")
-    def map_delete_layer(name: str) -> dict[str, Any]:
+    def map_delete_layer(
+        name: str,
+        request: Request,
+        session_id: str | None = None,
+        auth: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        ensure_admin(auth)
+        corr = getattr(request.state, "correlation_id", None) or correlation_id()
         if not is_safe_layer_name(name):
-            raise HTTPException(status_code=400, detail="허용되지 않은 레이어입니다.")
+            raise http_from_public(UserInputError("허용되지 않은 레이어입니다."))
         try:
-            delete_published_layer(get_settings(), name)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            owner = layer_owner_session(get_settings(), name)
+            if owner and session_id:
+                if not is_safe_session_id(session_id) or owner != session_id:
+                    raise http_from_public(UserInputError(
+                        "이 세션이 소유하지 않은 레이어입니다.",
+                        code="layer_ownership",
+                    ))
+            elif owner and auth.via != "loopback" and auth.role != "admin":
+                raise http_from_public(UserInputError(
+                    "레이어 소유권을 확인할 수 없습니다.",
+                    code="layer_ownership",
+                ))
+            delete_published_layer(
+                get_settings(), name, session_id=session_id, enforce_owner=bool(session_id)
+            )
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            raise _safe_http(exc, corr=corr, fallback="레이어를 삭제하지 못했습니다.") from exc
         return {"ok": True}
 
     @router.post("/session/cleanup")
-    def map_session_cleanup(body: SessionCleanupRequest) -> dict[str, Any]:
+    def map_session_cleanup(
+        body: SessionCleanupRequest,
+        request: Request,
+        auth: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        ensure_admin(auth)
+        corr = getattr(request.state, "correlation_id", None) or correlation_id()
         if not is_safe_session_id(body.session_id):
-            raise HTTPException(status_code=400, detail="허용되지 않은 세션입니다.")
+            raise http_from_public(UserInputError("허용되지 않은 세션입니다."))
         try:
             removed = cleanup_session_layers(get_settings(), body.session_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            raise _safe_http(
+                exc, corr=corr, fallback="세션 레이어를 정리하지 못했습니다."
+            ) from exc
         return {"ok": True, "removed": removed}
 
     @router.get("/choropleth/fields")
-    def choropleth_fields(layer: str) -> dict[str, Any]:
+    def choropleth_fields(
+        layer: str,
+        request: Request,
+        auth: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        ensure_user(auth)
+        corr = getattr(request.state, "correlation_id", None) or correlation_id()
         if not layer.strip():
-            raise HTTPException(status_code=400, detail="레이어가 필요합니다.")
+            raise http_from_public(UserInputError("레이어가 필요합니다."))
         try:
             return list_numeric_fields(get_settings(), layer.strip())
         except Exception as extra:
-            raise _choropleth_http(extra) from extra
+            raise _choropleth_http(extra, corr=corr) from extra
 
     @router.get("/choropleth/palettes")
-    def choropleth_palettes() -> dict[str, Any]:
+    def choropleth_palettes(auth: AuthContext = Depends(auth_dep)) -> dict[str, Any]:
+        ensure_user(auth)
         return {"ok": True, "palettes": list(PALETTES.keys())}
 
     @router.post("/choropleth/stats")
-    def choropleth_stats(body: ChoroplethStatsRequest) -> dict[str, Any]:
+    def choropleth_stats(
+        body: ChoroplethStatsRequest,
+        request: Request,
+        auth: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        ensure_user(auth)
+        corr = getattr(request.state, "correlation_id", None) or correlation_id()
         try:
             return field_stats(get_settings(), body.layer.strip(), body.field.strip())
         except Exception as extra:
-            raise _choropleth_http(extra) from extra
+            raise _choropleth_http(extra, corr=corr) from extra
 
     @router.post("/choropleth/classify")
-    def choropleth_classify(body: ChoroplethClassifyRequest) -> dict[str, Any]:
+    def choropleth_classify(
+        body: ChoroplethClassifyRequest,
+        request: Request,
+        auth: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        ensure_user(auth)
+        corr = getattr(request.state, "correlation_id", None) or correlation_id()
         try:
             data = preview(get_settings(), **body.model_dump())
             classification = data.get("classification") or {}
             return {"ok": True, **classification, "legend": data.get("legend")}
         except Exception as extra:
-            raise _choropleth_http(extra) from extra
+            raise _choropleth_http(extra, corr=corr) from extra
 
     @router.post("/choropleth/preview")
-    def choropleth_preview(body: ChoroplethClassifyRequest) -> dict[str, Any]:
+    def choropleth_preview(
+        body: ChoroplethClassifyRequest,
+        request: Request,
+        auth: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        ensure_user(auth)
+        corr = getattr(request.state, "correlation_id", None) or correlation_id()
         try:
             return preview(get_settings(), **body.model_dump())
         except Exception as extra:
-            raise _choropleth_http(extra) from extra
+            raise _choropleth_http(extra, corr=corr) from extra
 
     @router.post("/choropleth/apply")
-    def choropleth_apply(body: ChoroplethClassifyRequest) -> dict[str, Any]:
+    def choropleth_apply(
+        body: ChoroplethClassifyRequest,
+        request: Request,
+        auth: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        ensure_admin(auth)
+        corr = getattr(request.state, "correlation_id", None) or correlation_id()
         try:
             return apply_choropleth(get_settings(), **body.model_dump())
         except Exception as extra:
-            raise _choropleth_http(extra) from extra
+            raise _choropleth_http(extra, corr=corr) from extra
 
     @router.post("/choropleth/reset")
-    def choropleth_reset(body: ChoroplethResetRequest) -> dict[str, Any]:
+    def choropleth_reset(
+        body: ChoroplethResetRequest,
+        request: Request,
+        auth: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        ensure_admin(auth)
+        corr = getattr(request.state, "correlation_id", None) or correlation_id()
         try:
             return reset_choropleth(
                 get_settings(),
@@ -325,6 +477,6 @@ def create_map_router(
                 style_name=body.style_name,
             )
         except Exception as extra:
-            raise _choropleth_http(extra) from extra
+            raise _choropleth_http(extra, corr=corr) from extra
 
     return router

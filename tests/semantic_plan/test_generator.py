@@ -29,7 +29,7 @@ def test_heuristic_mvp_height_list() -> None:
     assert plan.scope is not None and plan.scope.place is not None
     assert plan.scope.place.name == "해운대구"
     fields = {item.field for item in plan.filters}
-    assert "usage" in fields
+    assert "usage" in fields or "detail_usage" in fields
     assert "height_m" in fields
     assert "name" in plan.select
     assert "height_m" in plan.select

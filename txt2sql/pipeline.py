@@ -34,7 +34,7 @@ from txt2sql.clarify_qa import (
     resolve_place_clarify_choice,
     unknown_term_guidance,
 )
-from txt2sql.config import Settings
+from txt2sql.config import Settings, database_url_for
 from txt2sql.db import connect, execute_query
 from txt2sql.domain import (
     extract_age_years,
@@ -69,6 +69,8 @@ from txt2sql.intent_classifier import (
 )
 from txt2sql.intent_router import RoutedQuery, try_route
 from txt2sql.meta_qa import answer_metadata_question, is_metadata_question
+from txt2sql.named_dataset_qa import try_named_dataset_query
+from txt2sql.place_area_qa import try_place_boundary_area_query
 from txt2sql.profile_qa import (
     answer_profile_question,
     answer_usage_overview_question,
@@ -146,6 +148,15 @@ def _ensure_result_table(
         )
     elif route == "legal_dong_admin_share":
         table = build_share_distribution(rows)
+    elif route.startswith("semantic_plan_") and result.get("semantic_plan"):
+        from txt2sql.semantic_plan.models import SemanticQueryPlan
+        from txt2sql.semantic_plan.result_shape import build_semantic_result_table
+
+        try:
+            plan = SemanticQueryPlan.model_validate(result["semantic_plan"])
+        except Exception:
+            plan = None
+        table = build_semantic_result_table(plan, rows, question=question)
     if table:
         result = dict(result)
         result["table"] = table
@@ -625,17 +636,23 @@ def _try_chart_turn(
             )
             session.update_from_result(question, result)
             return result
-        if session.pending_chart and is_chart_accept_question(question):
-            return _chart_reply(
-                answer="요청하신 내용을 차트로 정리했습니다.",
-                route="chart_render",
-                progress=progress,
-                on_token=on_token,
-                route_msg="차트 시각화 요청",
-                session=session,
-                question=question,
-                chart=dict(session.pending_chart),
-            )
+        if is_chart_accept_question(question):
+            chart = None
+            if session.pending_chart:
+                chart = dict(session.pending_chart)
+            elif base_chart is not None:
+                chart = dict(base_chart)
+            if chart is not None:
+                return _chart_reply(
+                    answer="요청하신 내용을 차트로 정리했습니다.",
+                    route="chart_render",
+                    progress=progress,
+                    on_token=on_token,
+                    route_msg="차트 시각화 요청",
+                    session=session,
+                    question=question,
+                    chart=chart,
+                )
         if session.pending_chart and is_chart_decline_question(question):
             return _chart_reply(
                 answer="알겠습니다. 텍스트 답변만 유지할게요. 다른 질문이 있으면 말씀해 주세요.",
@@ -646,6 +663,33 @@ def _try_chart_turn(
                 session=session,
                 question=question,
             )
+
+    # pending 없이도 last_rows로 재구성 가능한 차트 수락
+    if (
+        session is not None
+        and is_chart_accept_question(question)
+        and bool(session.last_rows)
+    ):
+        rebuild_route = infer_chart_rebuild_route(
+            session.last_route, list(session.last_rows)
+        )
+        if rebuild_route is not None:
+            chart = build_chart_spec(
+                route=rebuild_route,
+                rows=list(session.last_rows),
+                question=session.last_full_question or session.last_question or question,
+            )
+            if chart is not None:
+                return _chart_reply(
+                    answer="요청하신 내용을 차트로 정리했습니다.",
+                    route="chart_render",
+                    progress=progress,
+                    on_token=on_token,
+                    route_msg="차트 시각화 요청(재구성)",
+                    session=session,
+                    question=question,
+                    chart=chart,
+                )
 
     if is_chart_capability_question(question):
         return _chart_reply(
@@ -990,7 +1034,7 @@ def run_ask(
         contract = extract_contract(effective, binding=bind_catalog(effective))
     try:
         if conn is None:
-            with connect(settings.database_url) as owned:
+            with connect(database_url_for(settings, "query"), read_only=True) as owned:
                 result = _ask_inner(
                     effective,
                     settings,
@@ -1315,6 +1359,9 @@ def _finish_semantic_query(
     on_token: TokenCallback | None,
 ) -> dict[str, Any]:
     """SQP SQL 실행 결과를 기존 payload 형태로 맞춘다."""
+    from txt2sql.semantic_plan.models import SemanticQueryPlan
+    from txt2sql.semantic_plan.result_shape import build_semantic_result_table
+
     rows = list(semantic.get("rows") or [])
     sql = semantic.get("sql")
     route = str(semantic.get("route") or "semantic_plan_list")
@@ -1328,6 +1375,18 @@ def _finish_semantic_query(
     }
     if not settings.semantic_plan_debug:
         extra.pop("plan_quality", None)
+    plan_payload = semantic.get("semantic_plan")
+    plan_obj = None
+    if isinstance(plan_payload, dict):
+        try:
+            plan_obj = SemanticQueryPlan.model_validate(plan_payload)
+        except Exception:
+            plan_obj = None
+    elif plan_payload is not None and hasattr(plan_payload, "query_kind"):
+        plan_obj = plan_payload  # type: ignore[assignment]
+    table = build_semantic_result_table(plan_obj, rows, question=question)
+    if table:
+        extra["table"] = table
     return _payload(
         answer=answer,
         sql=sql,
@@ -1445,6 +1504,21 @@ def _after_shape_fail(
         or _keep_executed_semantic(question, retried, contract)
         or retried
     )
+
+
+def _semantic_blocks_rag_fallback(semantic: dict[str, Any]) -> bool:
+    """SQL 안전·명확화 실패는 RAG로 보내지 않는다. 계약 불완전은 RAG 허용."""
+    if semantic.get("needs_clarification"):
+        return True
+    reason = str(semantic.get("fallback_reason") or "")
+    if reason in {"readonly_failed", "sql_validation_failed"}:
+        return True
+    error = str(semantic.get("error") or "")
+    if "readonly" in reason.lower() or "readonly" in error.lower():
+        return True
+    if "sql_validation" in reason.lower():
+        return True
+    return False
 
 
 def _try_semantic_result(
@@ -1904,6 +1978,28 @@ def _ask_inner(
             return _qa_ok(meta)
         progress.emit("route", "메타 질의로 보였으나 매칭 실패 → SQL 경로")
 
+    named = try_place_boundary_area_query(conn, question)
+    if named is None:
+        named = try_named_dataset_query(conn, question)
+    if named is not None:
+        from txt2sql.intent_router import RoutedQuery
+
+        progress.emit(
+            "route",
+            f"업로드 표시명 데이터셋 조회 ({named.display_name})",
+        )
+        return _finish_routed_query(
+            question,
+            settings,
+            progress,
+            conn=conn,
+            ollama_client=ollama_client,
+            on_token=on_token,
+            routed=RoutedQuery(intent=named.intent, sql=named.sql),
+            route_label=f"named_dataset:{named.intent}",
+            contract=None,
+        )
+
     progress.emit("route", "모호성/미지 용어 점검")
     clarify = check_ambiguity(conn, question)
     followup_cue = has_anaphora(question) or any(
@@ -2095,6 +2191,7 @@ def _ask_inner(
                 )
             return finished
 
+    semantic: dict[str, Any] | None = None
     if settings.semantic_plan_mode in {"shadow", "hybrid"}:
         _emit_contract_routing(
             progress,
@@ -2159,24 +2256,35 @@ def _ask_inner(
                 )
             return finished
         if settings.semantic_plan_mode == "hybrid" and semantic.get("fallback"):
-            error = semantic.get("error") or semantic.get("fallback_reason") or "plan_fallback"
-            answer = format_failure(question, error=error, sql=semantic.get("sql"))
-            emit_text_chunks(answer, on_token)
-            fb_src = "semantic_plan_fallback"
-            if (
-                plan_bundle is not None
-                and getattr(plan_bundle.logical, "status", None) == "REPLAN"
-            ):
-                fb_src = "completeness_replan"
-            return _payload(
-                ok=False,
-                answer=answer,
-                sql=semantic.get("sql"),
-                tables=semantic.get("tables") or [],
-                error=error,
-                route=semantic.get("route"),
-                semantic_plan=semantic.get("semantic_plan"),
-                fallback_source=fb_src,
+            if _semantic_blocks_rag_fallback(semantic):
+                error = (
+                    semantic.get("error")
+                    or semantic.get("fallback_reason")
+                    or "plan_fallback"
+                )
+                answer = format_failure(question, error=error, sql=semantic.get("sql"))
+                emit_text_chunks(answer, on_token)
+                fb_src = "semantic_plan_fallback"
+                if (
+                    plan_bundle is not None
+                    and getattr(plan_bundle.logical, "status", None) == "REPLAN"
+                ):
+                    fb_src = "completeness_replan"
+                return _payload(
+                    ok=False,
+                    answer=answer,
+                    sql=semantic.get("sql"),
+                    tables=semantic.get("tables") or [],
+                    error=error,
+                    route=semantic.get("route"),
+                    semantic_plan=semantic.get("semantic_plan"),
+                    fallback_source=fb_src,
+                )
+            # Contract/plan incompleteness may fall through to RAG+LLM.
+            progress.emit(
+                "route",
+                "Semantic Plan fallback → RAG+LLM 허용: "
+                f"{semantic.get('fallback_reason')}",
             )
 
     if deferred_unknown is not None:
@@ -2191,12 +2299,22 @@ def _ask_inner(
         )
 
     progress.emit("route", "라우트 미매칭 → RAG+LLM 경로 (emergency fallback)")
+    sqp_rag_reason: str | None = None
+    if (
+        settings.semantic_plan_mode == "hybrid"
+        and isinstance(semantic, dict)
+        and semantic.get("fallback")
+        and not _semantic_blocks_rag_fallback(semantic)
+    ):
+        sqp_rag_reason = f"semantic_plan_fallback:{semantic.get('fallback_reason')}"
     rag_kwargs: dict[str, Any] = {
-        "fallback_reason": "route_and_plan_miss",
+        "fallback_reason": sqp_rag_reason or "route_and_plan_miss",
     }
     if plan_bundle is not None:
         # Phase J: unrestricted RAG only after planner coverage miss; snapshot required.
-        if plan_bundle.logical.status == "READY":
+        if sqp_rag_reason:
+            fallback_reason = sqp_rag_reason
+        elif plan_bundle.logical.status == "READY":
             fallback_reason = (
                 f"emergency_after_ready_miss;physical={plan_bundle.physical.strategy}"
             )

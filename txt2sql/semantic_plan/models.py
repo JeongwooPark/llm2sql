@@ -46,7 +46,9 @@ AggregateFunction = Literal[
     "max",
     "median",
     "stddev",
+    "variance",
     "percentile",
+    "corr",
 ]
 PlaceKind = Literal[
     "sido",
@@ -83,6 +85,10 @@ class PlaceSpec(BaseModel):
 
     name: str
     kind: PlaceKind = "unknown"
+    # Parent admin context for homonym disambiguation (optional, backward compatible).
+    sido: str | None = None
+    sigungu: str | None = None
+    code: str | None = None
 
 
 class ScopeSpec(BaseModel):
@@ -101,6 +107,8 @@ class FilterSpec(BaseModel):
     value2: Any | None = None
     unit: str | None = None
     value_field: str | None = None
+    # When set with value_field: left op (value_field * value_scale)
+    value_scale: float | None = None
 
 
 class OperandSpec(BaseModel):
@@ -110,6 +118,8 @@ class OperandSpec(BaseModel):
     field: str | None = None
     value: Any | None = None
     unit: str | None = None
+    # Field operand scale: left op (field * scale)
+    scale: float | None = None
 
 
 class PredicateSpec(BaseModel):
@@ -203,6 +213,33 @@ class OrderSpec(BaseModel):
     nulls: Literal["first", "last"] = "last"
 
 
+class BinSpec(BaseModel):
+    """Explicit binning for group_by. Prefer over width_bucket assumptions when set."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: str
+    edges: list[float] | None = None
+    width: float | None = None
+    labels: list[str] = Field(default_factory=list)
+
+
+class StageSpec(BaseModel):
+    """Optional multi-step plan stage (e.g. rank top-N then outer aggregate)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    kind: Literal["filter", "rank", "aggregate"]
+    filters: list[FilterSpec] = Field(default_factory=list)
+    predicate: PredicateSpec | None = None
+    select: list[str] = Field(default_factory=list)
+    aggregations: list[AggregationSpec] = Field(default_factory=list)
+    group_by: list[str] = Field(default_factory=list)
+    order_by: list[OrderSpec] = Field(default_factory=list)
+    limit: int | None = Field(default=None, ge=1, le=1000)
+
+
 class SpatialTargetSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -244,6 +281,10 @@ class SemanticQueryPlan(BaseModel):
 
     spatial_relations: list[SpatialRelationSpec] = Field(default_factory=list)
 
+    # P1 optional expressiveness — empty keeps legacy single-SELECT compile path.
+    bins: list[BinSpec] = Field(default_factory=list)
+    stages: list[StageSpec] = Field(default_factory=list)
+
     requires_clarification: bool = False
     ambiguities: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
@@ -278,5 +319,6 @@ ExpressionSpec.model_rebuild()
 AggregationSpec.model_rebuild()
 RatioSpec.model_rebuild()
 HavingSpec.model_rebuild()
+StageSpec.model_rebuild()
 SemanticQueryPlan.model_rebuild()
 SemanticQueryPlanV11 = SemanticQueryPlan

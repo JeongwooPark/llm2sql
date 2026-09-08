@@ -28,6 +28,18 @@ def _slot(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def _expression_fields(expr) -> set[str]:
+    """Collect field keys referenced by an AggregationSpec.expression tree."""
+    if expr is None:
+        return set()
+    if getattr(expr, "kind", None) == "field" and getattr(expr, "field", None):
+        return {str(expr.field)}
+    found: set[str] = set()
+    found |= _expression_fields(getattr(expr, "left", None))
+    found |= _expression_fields(getattr(expr, "right", None))
+    return found
+
+
 def verify_contract(
     question: str,
     plan: SemanticQueryPlan,
@@ -82,16 +94,16 @@ def verify_contract(
         if ratio.denominator_predicate is not None:
             semantic_pred_fields |= predicate_fields(ratio.denominator_predicate)
     # 허가↔승인 시차는 assumption SQL로 표현 — 슬롯 커버로 인정
-    if any(
-        a.startswith("permit_day_gap_")
-        or a.startswith("permit_year_gap:")
-        or a in {"permit_after_approval", "permit_approval_year_neq"}
-        for a in (plan.assumptions or [])
-    ):
+    from txt2sql.domain import assumptions_include_permit_lag
+
+    if assumptions_include_permit_lag(plan.assumptions):
         semantic_pred_fields |= {"permit_date", "approval_date"}
     pred_fields = {item.field for item in plan.filters}
     pred_fields |= semantic_pred_fields
     pred_fields |= {item.field for item in plan.aggregations if item.field}
+    # 허가일−사용승인일 등 expression 집계 필드도 fields 슬롯에 포함
+    for agg in plan.aggregations:
+        pred_fields |= _expression_fields(agg.expression)
     pred_fields |= set(plan.select)
     pred_fields |= set(plan.group_by)
     for ratio in plan.ratios:
@@ -99,7 +111,25 @@ def verify_contract(
             pred_fields |= predicate_fields(ratio.numerator_predicate)
         if ratio.denominator_predicate is not None:
             pred_fields |= predicate_fields(ratio.denominator_predicate)
-    metric_fields = {span.value for span in contract.metrics if span.value}
+    metric_fields: set[str] = set()
+    for span in contract.metrics:
+        field = span.value
+        if not field:
+            continue
+        # 범주형 개체 라벨(아파트·공장 등)은 predicate로 검증하고 fields 슬롯에서는 제외.
+        if field in {
+            "usage",
+            "detail_usage",
+            "structure",
+            "violation_status",
+            "special_land",
+        } and str(span.text) not in {"용도", "구조", "세부용도", "위반"}:
+            continue
+        metric_fields.add(str(field))
+    # 건축연령 집계는 approval_date 파생 — 한쪽만 있어도 fields 커버
+    if metric_fields & {"building_age_years", "approval_date"}:
+        if pred_fields & {"building_age_years", "approval_date"}:
+            pred_fields = pred_fields | (metric_fields & {"building_age_years", "approval_date"})
     field_hits = len(metric_fields & pred_fields)
     fields_score = 1.0 if not metric_fields else field_hits / len(metric_fields)
 
@@ -107,46 +137,222 @@ def verify_contract(
     threshold_numbers = [
         span
         for span in contract.numbers
-        if any(
-            hint in contract.question[span.end : span.end + 10]
-            for hint in ("이상", "이하", "초과", "미만", "보다")
+        if span.meta.get("role", "threshold") == "threshold"
+        and (
+            span.meta.get("operator")
+            or any(
+                hint in contract.question[span.end : span.end + 10]
+                for hint in ("이상", "이하", "초과", "미만", "보다")
+            )
         )
     ]
-    wanted_predicate_fields = {
-        str(span.meta.get("field"))
-        for span in threshold_numbers + contract.ranges
-        if span.meta.get("field")
+    wanted_atoms: list[tuple[str, str | None, object]] = []
+    for span in threshold_numbers:
+        field = span.meta.get("field")
+        if not field:
+            continue
+        wanted_atoms.append(
+            (str(field), span.meta.get("operator"), getattr(span, "value", None))
+        )
+    for span in contract.ranges:
+        field = span.meta.get("field")
+        if field:
+            wanted_atoms.append((str(field), "between", span.meta.get("low")))
+    # 명시 BinSpec(edges)로 구간을 표현하면 WHERE 임계 필터는 요구하지 않는다.
+    bin_fields = {
+        str(spec.field)
+        for spec in (plan.bins or [])
+        if spec.field and (spec.edges or spec.width is not None)
     }
+    if bin_fields:
+        wanted_atoms = [
+            atom for atom in wanted_atoms if atom[0] not in bin_fields
+        ]
+    wanted_predicate_fields = {field for field, _op, _val in wanted_atoms}
     if wanted_predicate_fields and not wanted_predicate_fields <= semantic_pred_fields:
         pred_score = 0.0
         reasons.append("missing_predicate")
+        reasons.append("PREDICATE_DROPPED")
         reasons.append("P03")
+    # Operator mismatch: field present with wrong operator is PREDICATE_DROPPED.
+    # Ratio / aggregation stage predicates count as plan leaves (conditional ratio).
+    from txt2sql.semantic_plan.predicate_utils import walk_predicate
+
+    plan_predicate_roots = [pred] if pred is not None else []
+    for agg in plan.aggregations or []:
+        if agg.predicate is not None:
+            plan_predicate_roots.append(agg.predicate)
+    for ratio in plan.ratios or []:
+        if ratio.numerator_predicate is not None:
+            plan_predicate_roots.append(ratio.numerator_predicate)
+        if ratio.denominator_predicate is not None:
+            plan_predicate_roots.append(ratio.denominator_predicate)
+
+    plan_leaves = list(plan.filters)
+    for field, operator, value in wanted_atoms:
+        if operator in {None, "between"}:
+            continue
+        matched = any(
+            item.field == field
+            and item.operator == operator
+            and (
+                value is None
+                or item.value == value
+                or float(item.value or 0) == float(value or 0)
+            )
+            for item in plan_leaves
+            if item.field
+        )
+        if matched:
+            continue
+        value_ok = False
+        for root in plan_predicate_roots:
+            if root is None:
+                continue
+            if not (field in predicate_fields(root) and has_operator(root, operator)):
+                continue
+            if value is None:
+                value_ok = True
+                break
+            for node in walk_predicate(root):
+                if (
+                    node.op == "cmp"
+                    and node.left
+                    and node.left.field == field
+                    and node.operator == operator
+                    and node.right is not None
+                    and (
+                        node.right.value == value
+                        or float(node.right.value or 0) == float(value or 0)
+                    )
+                ):
+                    value_ok = True
+                    break
+            if value_ok:
+                break
+        if value_ok:
+            continue
+        pred_score = 0.0
+        if "PREDICATE_DROPPED" not in reasons:
+            reasons.append("missing_predicate")
+            reasons.append("PREDICATE_DROPPED")
+            reasons.append("P03")
+
+    # Categorical metric atoms (usage vs detail_usage are distinct).
+    from txt2sql.domain import extract_detail_usages
+
+    detail_hits = set(extract_detail_usages(question) or [])
+    for span in contract.metrics:
+        field = span.value
+        if field not in {"usage", "detail_usage", "structure", "violation_status"}:
+            continue
+        if str(span.text) in {"용도", "구조", "세부용도", "위반"}:
+            continue
+        canonical = str(span.meta.get("canonical") or span.text or "").strip()
+        if not canonical:
+            continue
+        present = field in semantic_pred_fields or any(
+            item.field == field for item in plan.filters
+        )
+        # Detail aliases (아파트 등) are correctly bound to detail_usage even when
+        # contract metric slot is labeled usage.
+        if (
+            not present
+            and field == "usage"
+            and detail_hits
+            and (
+                "detail_usage" in semantic_pred_fields
+                or any(item.field == "detail_usage" for item in plan.filters)
+            )
+        ):
+            present = True
+        if not present:
+            pred_score = 0.0
+            if "PREDICATE_DROPPED" not in reasons:
+                reasons.append("PREDICATE_DROPPED")
+                reasons.append("P03")
+            continue
+        # Main-usage contract must not be satisfied by detail_usage alone when
+        # the text is a main usage label (not a detail alias).
+        if (
+            field == "usage"
+            and not detail_hits
+            and "usage" not in semantic_pred_fields
+            and not any(item.field == "usage" for item in plan.filters)
+            and "detail_usage" in semantic_pred_fields
+        ):
+            pred_score = 0.0
+            reasons.append("ENTITY_SELECTION_ERROR")
+            reasons.append("PREDICATE_DROPPED")
     if any(span.kind == "or" for span in contract.boolean_ops):
         if not has_op(pred, "or"):
             pred_score = 0.0
+            reasons.append("BOOLEAN_OR_DROPPED")
             reasons.append("P04")
     if any(span.kind == "not" for span in contract.boolean_ops):
         has_not = has_op(pred, "not") or any(item.operator == "neq" for item in plan.filters)
         if not has_not:
             pred_score = 0.0
+            reasons.append("BOOLEAN_NOT_DROPPED")
             reasons.append("P04")
-    if contract.ranges:
-        range_ok = has_operator(pred, "between")
-        if not range_ok:
-            for span in contract.ranges:
-                field = span.meta.get("field")
-                low, high = range_bounds(pred, field) if field else (None, None)
-                if low is None or high is None:
-                    range_ok = False
+        else:
+            # NOT(A OR B) must wrap an OR subtree — flat neq list is not enough.
+            for span in contract.boolean_ops:
+                if span.kind != "not":
+                    continue
+                if not (span.meta or {}).get("scopes_or"):
+                    continue
+                if not has_op(pred, "not"):
+                    pred_score = 0.0
+                    reasons.append("BOOLEAN_NOT_DROPPED")
+                    reasons.append("P04")
                     break
-                range_ok = True
+                from txt2sql.semantic_plan.predicate_utils import walk_predicate
+
+                not_wraps_or = False
+                if pred is not None:
+                    for node in walk_predicate(pred):
+                        if node.op == "not" and any(
+                            (child.op == "or") for child in (node.args or [])
+                        ):
+                            not_wraps_or = True
+                            break
+                if not not_wraps_or:
+                    pred_score = 0.0
+                    reasons.append("BOOLEAN_NOT_DROPPED")
+                    reasons.append("P04")
+                    break
+    if contract.ranges:
+        bin_fields = {
+            str(spec.field)
+            for spec in (plan.bins or [])
+            if spec.field and (spec.edges or spec.width is not None)
+        }
+        pending_ranges = [
+            span
+            for span in contract.ranges
+            if str(span.meta.get("field") or "") not in bin_fields
+        ]
+        range_ok = True
+        if pending_ranges:
+            range_ok = has_operator(pred, "between")
+            if not range_ok:
+                for span in pending_ranges:
+                    field = span.meta.get("field")
+                    low, high = range_bounds(pred, field) if field else (None, None)
+                    if low is None or high is None:
+                        range_ok = False
+                        break
+                    range_ok = True
         if not range_ok:
             pred_score = min(pred_score, 0.0)
+            reasons.append("RANGE_BOUND_DROPPED")
             reasons.append("P03")
     if contract.comparisons:
         has_ff = has_field_compare(pred) or any(item.value_field for item in plan.filters)
         if not has_ff:
             pred_score = 0.0
+            reasons.append("PREDICATE_DROPPED")
             reasons.append("P03")
 
     agg_score = 1.0
@@ -212,13 +418,28 @@ def verify_contract(
 
     if contract.ratios:
         if not plan.ratios:
-            reasons.append("missing_ratio")
-            agg_score = min(agg_score, 0.0)
+            q = contract.question or ""
+            # 구조별·용도별 구성비(전체 대비 백분율)는 group+count로 충족
+            composition = bool(plan.group_by) and any(
+                a.function == "count" for a in (plan.aggregations or [])
+            ) and any(k in q for k in ("백분율", "전체 대비", "구성비", "비중"))
+            if not composition:
+                reasons.append("missing_ratio")
+                agg_score = min(agg_score, 0.0)
         elif any(item.has_denominator for item in contract.ratios) and any(
             item.denominator_predicate is None for item in plan.ratios
         ):
             reasons.append("missing_ratio_denominator")
             agg_score = min(agg_score, 0.0)
+        else:
+            # Identical numerator and denominator predicates → always 100%.
+            for ratio in plan.ratios or []:
+                num = ratio.numerator_predicate
+                den = ratio.denominator_predicate
+                if num is not None and den is not None and num == den:
+                    reasons.append("ratio_stage_mismatch")
+                    agg_score = min(agg_score, 0.0)
+                    break
 
     spatial_score = 1.0
     if contract.places and plan.spatial_relations:

@@ -352,13 +352,23 @@ def sigungu_for_legal_dong(
         if narrowed:
             candidates = narrowed
 
-    from txt2sql.domain import extract_gu
+    from txt2sql.domain import D198_BY_GU, extract_gu
 
     explicit_gu = extract_gu(question)
     if explicit_gu and explicit_gu in candidates:
         return explicit_gu
 
-    return candidates[0] if len(candidates) == 1 else None
+    # 시·도 축소 후에도 동명이의면: D198 커버 구를 우선하고,
+    # 여러 개면 gazetteer 후보 순서(대표 구)를 따른다. None으로 포기하면
+    # usage+동 집계가 D010으로 퇴화한다.
+    if D198_BY_GU:
+        covered = [gu for gu in candidates if gu in D198_BY_GU]
+        if len(covered) == 1:
+            return covered[0]
+        if covered:
+            return covered[0]
+
+    return candidates[0] if candidates else None
 
 
 def classify_place(name: str) -> frozenset[str]:
@@ -414,20 +424,20 @@ def uses_admin_boundary(
     prefer_admin: bool = False,
     question: str = "",
 ) -> bool:
-    """BND 행정동 경계 집계가 필요한지 (PlaceScopePolicy v1.0).
+    """BND 행정동 경계 집계가 필요한지 (PlaceScopePolicy / P012 §8).
 
-    - 순수 행정동(admin_dong만 gazetteer 등록) → 항상 BND
-    - 법정동만 → A4 (uses_admin_boundary False)
-    - 행정·법정 동시 등록 → 질문 공간 cue 또는 prefer_admin
+    - 명시적 공간 cue(행정동·경계·내부·이내·반경 등) 또는 prefer_admin → BND
+    - 단순 동 이름만(번호 행정동 포함) → A4 속성 필터 (공간 조인 강제 금지)
+    - 행정·법정 동시 등록이어도 cue 없으면 A4
     """
     if not name:
         return False
     text = str(name).strip()
     kinds = classify_place(text)
-    if KIND_ADMIN in kinds and KIND_LEGAL not in kinds:
-        return True
     needs_bnd = prefer_admin or question_needs_admin_boundary(question)
-    if needs_bnd and KIND_ADMIN in kinds:
+    if not needs_bnd:
+        return False
+    if KIND_ADMIN in kinds:
         return True
     return False
 

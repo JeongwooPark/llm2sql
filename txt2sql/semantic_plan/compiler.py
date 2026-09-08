@@ -30,6 +30,7 @@ from txt2sql.semantic_plan.catalog import (
 )
 from txt2sql.semantic_plan.migrate import validate_predicate
 from txt2sql.semantic_plan.models import (
+    AggregationSpec,
     ExpressionSpec,
     FilterSpec,
     PredicateSpec,
@@ -76,6 +77,12 @@ D198_BUILDING_COLUMNS = dict(D198_FIELD_COLUMNS)
 
 
 def compile_semantic_plan(plan: SemanticQueryPlan) -> CompiledSemanticQuery:
+    if getattr(plan, "stages", None):
+        return _compile_with_stages(plan)
+    return _compile_flat_semantic_plan(plan)
+
+
+def _compile_flat_semantic_plan(plan: SemanticQueryPlan) -> CompiledSemanticQuery:
     entity = get_entity(plan.entity)
     alias = _ENTITY_ALIAS.get(plan.entity, "t")
     col_map = _column_override(plan)
@@ -117,6 +124,14 @@ def compile_semantic_plan(plan: SemanticQueryPlan) -> CompiledSemanticQuery:
                 where.append(
                     f'{alias}."ADM_CD" LIKE {_literal(prefix + "%", "text")}'
                 )
+            elif plan.entity == "industrial_complex":
+                from txt2sql.gazetteer import sido_pnu_prefix
+
+                pnu = sido_pnu_prefix(sido_name or name)
+                if pnu:
+                    where.append(
+                        f'{alias}."A4" LIKE {_literal(str(pnu) + "%", "text")}'
+                    )
             name = ""
         if not name:
             pass
@@ -126,11 +141,14 @@ def compile_semantic_plan(plan: SemanticQueryPlan) -> CompiledSemanticQuery:
             if extra and plan.entity == "admin_area":
                 where.append(extra)
         else:
-            want_boundary = (
-                place.kind == "admin_dong"
-                or spatial_mode == "boundary"
-                or (spatial_mode == "auto" and uses_admin_boundary(name))
-            )
+            # P012 §8: BND only when spatial_mode requests boundary (or explicit cue).
+            # place.kind==admin_dong alone must not force a spatial join.
+            if spatial_mode == "boundary":
+                want_boundary = True
+            elif spatial_mode == "attribute":
+                want_boundary = False
+            else:
+                want_boundary = False
             # 구·군은 BND ADM_NM이 아님 → A3 접두 (전국: sigungu_a3_prefix)
             is_gu = place.kind == "gu" or (
                 name.endswith(("구", "군"))
@@ -153,14 +171,28 @@ def compile_semantic_plan(plan: SemanticQueryPlan) -> CompiledSemanticQuery:
             else:
                 where.append(_building_place_sql(alias, name, plan=plan))
 
-    # 동 스코프 + 부가 구 필터
+    # 동 스코프 + 부가 구 필터 (assumption 또는 PlaceSpec.sigungu/code)
     gu_scope = next(
         (a for a in (plan.assumptions or []) if a.startswith("scope_gu:")),
         None,
     )
+    parent_gu = None
+    parent_code = None
     if gu_scope and plan.entity == "building":
-        gu_name = gu_scope.split(":", 1)[1]
-        code = sigungu_a3_prefix(gu_name)
+        parent_gu = gu_scope.split(":", 1)[1]
+    elif place and plan.entity == "building" and place.kind in {
+        "legal_dong",
+        "admin_dong",
+        "unknown",
+    }:
+        parent_gu = place.sigungu
+        parent_code = place.code
+    if parent_gu or parent_code:
+        code = parent_code or (
+            sigungu_a3_prefix(parent_gu, sido=_plan_sido_context(plan))
+            if parent_gu
+            else None
+        )
         if code:
             where.append(f'{alias}."A3" LIKE {_literal(code + "%", "text")}')
 
@@ -285,6 +317,155 @@ def compile_semantic_plan(plan: SemanticQueryPlan) -> CompiledSemanticQuery:
     )
 
 
+def _compile_with_stages(plan: SemanticQueryPlan) -> CompiledSemanticQuery:
+    """Compile multi-stage plans as WITH CTEs (e.g. top-N then outer aggregate).
+
+    Contract:
+    - Common place/filters/spatial live on stage 0 (population).
+    - Outer plan.ratios FILTER only ratio predicates (population already in CTE).
+    - Empty stages never reach here (caller checks).
+    """
+    stages = list(plan.stages or [])
+    if not stages:
+        return _compile_flat_semantic_plan(plan)
+
+    stage0 = stages[0]
+    inner = plan.model_copy(deep=True)
+    inner.stages = []
+    inner.bins = list(plan.bins or [])
+    if stage0.filters:
+        inner.filters = list(stage0.filters) + list(inner.filters or [])
+    if stage0.predicate is not None:
+        inner.predicate = stage0.predicate
+    if stage0.select:
+        inner.select = list(stage0.select)
+    if stage0.order_by:
+        inner.order_by = list(stage0.order_by)
+    if stage0.limit is not None:
+        inner.limit = stage0.limit
+    if stage0.group_by:
+        inner.group_by = list(stage0.group_by)
+
+    # Stage 0 is the row population (rank/filter); strip outer aggs/ratios.
+    inner.aggregations = []
+    inner.ratios = []
+    if stage0.kind == "aggregate" and stage0.aggregations:
+        inner.aggregations = list(stage0.aggregations)
+        inner.query_kind = "aggregate"
+        if stage0.group_by:
+            inner.group_by = list(stage0.group_by)
+    elif stage0.kind == "rank":
+        inner.query_kind = "rank"
+        if not inner.select and stage0.order_by:
+            metric = stage0.order_by[0].field
+            inner.select = ["name", "legal_dong", "lot_address", metric]
+    else:
+        inner.query_kind = "list" if inner.select else "rank"
+
+    compiled_inner = _compile_flat_semantic_plan(inner)
+    if len(stages) == 1 and not plan.ratios:
+        return compiled_inner
+
+    inner_sql = compiled_inner.sql.rstrip().rstrip(";")
+    cte = "stage_0"
+    outer_alias = "s0"
+    pieces: list[str] = []
+    params: list[object] = list(compiled_inner.params or [])
+
+    # Remaining stages after 0: currently one outer aggregate (or ratios).
+    outer_aggs: list[AggregationSpec] = []
+    if len(stages) >= 2:
+        outer_aggs = list(stages[1].aggregations or [])
+    if not outer_aggs and plan.aggregations and len(stages) >= 2:
+        outer_aggs = list(plan.aggregations)
+
+    for agg in outer_aggs:
+        out_alias = agg.alias or (
+            agg.function if not agg.field else f"{agg.function}_{agg.field}"
+        )
+        if not _IDENT_RE.fullmatch(out_alias):
+            raise SemanticCompileError(f"invalid aggregation alias: {out_alias}")
+        if agg.function == "count" and not agg.field:
+            pieces.append(f'COUNT(*) AS {_ident(out_alias)}')
+            continue
+        if not agg.field:
+            raise SemanticCompileError("stage aggregate requires field")
+        col = f"{outer_alias}.{_ident(agg.field)}"
+        fn = agg.function.upper()
+        if agg.function == "percentile":
+            pct = float(agg.percentile if agg.percentile is not None else 0.5)
+            pieces.append(
+                f"percentile_cont({sql_number(pct)}) WITHIN GROUP "
+                f"(ORDER BY {col}) AS {_ident(out_alias)}"
+            )
+        elif agg.expression is not None:
+            raise SemanticCompileError("stage expression aggregates not supported")
+        else:
+            pieces.append(f"{fn}({col}::float8) AS {_ident(out_alias)}")
+
+    # Ratios over stage-0 population: common WHERE already applied in CTE.
+    # CTE columns are semantic aliases from stage0 SELECT — use identity col_map.
+    if plan.ratios:
+        from txt2sql.semantic_plan.predicate_utils import predicate_fields
+
+        identity_map: dict[str, str] = {}
+        for key in inner.select or []:
+            identity_map[key] = key
+        for ratio in plan.ratios:
+            for pred in (
+                ratio.numerator_predicate,
+                ratio.denominator_predicate,
+            ):
+                for node in predicate_fields(pred):
+                    identity_map[node] = node
+        # Ensure stage0 projected ratio fields (recompile if missing).
+        needed = [k for k in identity_map if k not in (inner.select or [])]
+        if needed:
+            inner.select = list(inner.select or []) + needed
+            compiled_inner = _compile_flat_semantic_plan(inner)
+            inner_sql = compiled_inner.sql.rstrip().rstrip(";")
+            params = list(compiled_inner.params or [])
+        ratio_plan = plan.model_copy(deep=True)
+        ratio_plan.stages = []
+        ratio_plan.filters = []
+        ratio_plan.predicate = None
+        for ratio in plan.ratios:
+            pieces.append(
+                _ratio_sql(outer_alias, ratio_plan, ratio, col_map=identity_map)
+            )
+
+    if not pieces:
+        raise SemanticCompileError("stages compile produced empty outer SELECT")
+
+    sql = (
+        f"WITH {_ident(cte)} AS (\n{inner_sql}\n)\n"
+        f"SELECT {', '.join(pieces)}\n"
+        f"FROM {_ident(cte)} {outer_alias};"
+    )
+    _assert_safe_sql(sql)
+    tables = list(compiled_inner.tables)
+    _assert_table_columns(sql, plan.entity, tables)
+    extra = dict(compiled_inner.extra or {})
+    prior_trace = dict(extra.get("compile_trace") or {})
+    prior_aggs = list(prior_trace.get("aggregations") or [])
+    prior_aggs.extend(agg.function for agg in outer_aggs)
+    extra["compile_trace"] = {
+        **prior_trace,
+        "aggregations": prior_aggs,
+        "stages": [s.kind for s in stages],
+        "cte": True,
+    }
+    return CompiledSemanticQuery(
+        sql=sql,
+        tables=tables,
+        route=f"semantic_plan_{plan.query_kind}",
+        semantic_plan=plan.model_dump(),
+        uses_boundary=compiled_inner.uses_boundary,
+        extra=extra,
+        params=params,
+    )
+
+
 def _field_col(
     alias: str,
     entity: str,
@@ -293,7 +474,9 @@ def _field_col(
 ):
     field = get_field(entity, key)
     column = (col_map or {}).get(key) or field.column
-    return field, _col(alias, column)
+    # Identity col_map (CTE semantic aliases) must not require physical allowlist.
+    physical = not (col_map is not None and col_map.get(key) == key)
+    return field, _col(alias, column, physical=physical)
 
 
 def _select_sql(
@@ -317,10 +500,23 @@ def _select_sql(
         return 'SELECT COUNT(*) AS "count"'
     if plan.query_kind in {"aggregate", "distribution"} or plan.ratios:
         pieces: list[str] = []
+        if "group_by_industrial_name" in (plan.assumptions or []):
+            pieces.append(
+                'COALESCE(NULLIF(TRIM(ind."A8"), \'\'), NULLIF(TRIM(ind."A9"), \'\')) '
+                'AS "park"'
+            )
         for key in plan.group_by:
+            if "group_by_industrial_name" in (plan.assumptions or []):
+                continue
             _field, col = _field_col(alias, plan.entity, key, col_map)
             if key == "approval_date" and "approval_decade" in (plan.assumptions or []):
                 pieces.append(f"{_approval_decade_expr(col)} AS {_ident('decade')}")
+            elif key == "approval_date" and "approval_year_group" in (
+                plan.assumptions or []
+            ):
+                pieces.append(
+                    f"({_approval_year_expr(col)})::int AS {_ident('y')}"
+                )
             elif _bin_expr_for(plan, key, col) is not None:
                 pieces.append(
                     f"{_bin_expr_for(plan, key, col)} AS {_ident(key)}"
@@ -335,7 +531,32 @@ def _select_sql(
         if not aggs and not plan.ratios and plan.query_kind == "distribution":
             pieces.append('COUNT(*) AS "n"')
         for agg in aggs:
-            pieces.append(_agg_sql(alias, plan.entity, agg, col_map=col_map))
+            pieces.append(_agg_sql(alias, plan.entity, agg, col_map=col_map, plan=plan))
+        # 스칼라 avg/sum/min/max 는 gold가 n을 함께 요구하는 경우가 많음
+        has_count = any(
+            (a.function or "").lower() == "count" or (a.alias or "") in {"n", "count"}
+            for a in aggs
+        )
+        if (
+            aggs
+            and not has_count
+            and not plan.group_by
+            and not plan.ratios
+            and plan.query_kind == "aggregate"
+        ):
+            # 상관계수 단독 집계도 FILTER 모집단 n을 붙인다
+            if any((a.function or "").lower() == "corr" for a in aggs):
+                pieces.append(
+                    _agg_sql(
+                        alias,
+                        plan.entity,
+                        AggregationSpec(function="count", field=None, alias="n"),
+                        col_map=col_map,
+                        plan=plan,
+                    )
+                )
+            else:
+                pieces.append('COUNT(*) AS "n"')
         if not pieces:
             raise SemanticCompileError("aggregate/distribution needs aggregations")
         return "SELECT " + ",\n       ".join(pieces)
@@ -369,7 +590,11 @@ def _compile_expression(
         if not expr.field:
             raise SemanticCompileError("expression field missing")
         field, col = _field_col(alias, entity, expr.field, col_map)
-        return f"{col}::float8" if field.data_type == "number" else col
+        if field.data_type == "number":
+            return f"{col}::float8"
+        if expr.field in {"approval_date", "permit_date"}:
+            return f"{col}::date"
+        return col
     if expr.left is None or expr.right is None:
         raise SemanticCompileError("expression operands required")
     left = _compile_expression(alias, entity, expr.left, col_map)
@@ -381,6 +606,9 @@ def _compile_expression(
     if expr.kind == "add":
         return f"({left} + {right})"
     if expr.kind == "subtract":
+        # date - date → integer days (허가→승인 소요일)
+        if "::date" in left and "::date" in right:
+            return f"(({left}) - ({right}))"
         return f"({left} - {right})"
     raise SemanticCompileError(f"unsupported expression kind: {expr.kind}")
 
@@ -420,6 +648,8 @@ def _ratio_sql(
     ratio,
     col_map: dict[str, str] | None = None,
 ) -> str:
+    from txt2sql.semantic_plan.predicate_utils import walk_predicate
+
     lag = _permit_lag_ratio_filter(alias, plan, col_map=col_map)
     if lag is not None:
         num = lag
@@ -427,11 +657,26 @@ def _ratio_sql(
         num, _, _ = _predicate_sql(
             alias, plan.entity, ratio.numerator_predicate, col_map=col_map
         )
+    num_fields: set[str] = set()
+    if ratio.numerator_predicate is not None:
+        for node in walk_predicate(ratio.numerator_predicate):
+            if node.left and node.left.field:
+                num_fields.add(node.left.field)
     if ratio.denominator_predicate is not None:
         den, _, _ = _predicate_sql(
             alias, plan.entity, ratio.denominator_predicate, col_map=col_map
         )
         den_count = f"COUNT(*) FILTER (WHERE {den})"
+    elif num_fields & {"approval_date", "building_age_years", "permit_date"}:
+        # 사용승인 기반 비율: 분모는 유효 일자 건수 (골드 grain)
+        date_field = (
+            "permit_date" if "permit_date" in num_fields else "approval_date"
+        )
+        date_col = _semantic_date_col(alias, date_field, col_map)
+        den_count = (
+            f"COUNT(*) FILTER (WHERE {date_col}::text "
+            f"~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$')"
+        )
     else:
         den_count = "COUNT(*)"
     out = ratio.alias or "ratio_pct"
@@ -448,6 +693,8 @@ def _agg_sql(
     entity: str,
     agg,
     col_map: dict[str, str] | None = None,
+    *,
+    plan: SemanticQueryPlan | None = None,
 ) -> str:
     function = agg.function
     field_key = agg.field
@@ -455,7 +702,7 @@ def _agg_sql(
     if not _IDENT_RE.fullmatch(out):
         raise SemanticCompileError(f"invalid aggregation alias: {out}")
     filter_parts: list[str] = []
-    if getattr(agg, "filter_field", None):
+    if getattr(agg, "filter_field", None) and function != "corr":
         extra, _ = _filter_sql(
             alias,
             entity,
@@ -473,7 +720,61 @@ def _agg_sql(
     filter_sql = f" FILTER (WHERE {' AND '.join(filter_parts)})" if filter_parts else ""
     if agg.expression is not None:
         expr = _compile_expression(alias, entity, agg.expression, col_map)
+        # 허가일−승인일 일수: 양쪽 ISO date 필요
+        if (
+            agg.expression.kind == "subtract"
+            and agg.expression.left
+            and agg.expression.right
+            and {agg.expression.left.field, agg.expression.right.field}
+            <= {"approval_date", "permit_date"}
+        ):
+            for date_field in ("permit_date", "approval_date"):
+                _f, dcol = _field_col(alias, entity, date_field, col_map)
+                filter_parts.append(
+                    f"({dcol}::text ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$')"
+                )
+            filter_sql = (
+                f" FILTER (WHERE {' AND '.join(filter_parts)})" if filter_parts else ""
+            )
     elif function == "count" and not field_key:
+        industrial = bool(
+            plan
+            and any(
+                getattr(rel.target, "entity", None) == "industrial_complex"
+                for rel in (plan.spatial_relations or [])
+            )
+        )
+        if industrial and entity == "building":
+            return f'COUNT(DISTINCT {alias}."A1"){filter_sql} AS {_ident(out)}'
+        # 상관계수와 함께 쓰는 n은 CORR FILTER와 동일 모집단
+        if plan is not None:
+            corr_peer = next(
+                (
+                    peer
+                    for peer in (plan.aggregations or [])
+                    if (peer.function or "").lower() == "corr"
+                    and peer.field
+                    and peer.filter_field
+                ),
+                None,
+            )
+            if corr_peer is not None:
+                _xf, x_col = _field_col(alias, entity, str(corr_peer.field), col_map)
+                _yf, y_col = _field_col(
+                    alias, entity, str(corr_peer.filter_field), col_map
+                )
+                if corr_peer.field == "building_age_years":
+                    ref = _ref_sql()
+                    x_ok = (
+                        f"({x_col}::text ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$')"
+                    )
+                else:
+                    x_ok = f"{x_col}::float8 IS NOT NULL"
+                y_ok = f"{y_col}::float8 IS NOT NULL"
+                return (
+                    f"COUNT(*) FILTER (WHERE {x_ok} AND {y_ok}) "
+                    f"AS {_ident(out)}"
+                )
         return f"COUNT(*){filter_sql} AS {_ident(out)}"
     elif not field_key:
         raise SemanticCompileError(f"{function} requires a field")
@@ -481,7 +782,38 @@ def _agg_sql(
         field, col = _field_col(alias, entity, field_key, col_map)
         if not field.aggregatable:
             raise SemanticCompileError(f"field is not aggregatable: {field_key}")
-        expr = f"{col}::float8"
+        if field_key == "building_age_years":
+            # Gold grain: fractional years via day delta / 365.25 (ISO dates).
+            ref = _ref_sql()
+            expr = f"(({ref}::date - {col}::date)::float8 / 365.25)"
+            iso = f"({col}::text ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$')"
+            filter_parts = [iso, *filter_parts]
+            filter_sql = (
+                f" FILTER (WHERE {' AND '.join(filter_parts)})" if filter_parts else ""
+            )
+        elif entity == "industrial_complex" and field_key == "area_m2":
+            expr = f"ST_Area({alias}.geometry::geography)"
+        else:
+            expr = f"{col}::float8"
+    if function == "corr":
+        # field = X, filter_field = Y (no FILTER clause for corr partner).
+        if not field_key or not getattr(agg, "filter_field", None):
+            raise SemanticCompileError("corr requires field and filter_field")
+        x_field, x_col = _field_col(alias, entity, field_key, col_map)
+        y_field, y_col = _field_col(alias, entity, str(agg.filter_field), col_map)
+        if field_key == "building_age_years":
+            ref = _ref_sql()
+            x_expr = f"(({ref}::date - {x_col}::date)::float8 / 365.25)"
+            x_ok = f"({x_col}::text ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$')"
+        else:
+            x_expr = f"{x_col}::float8"
+            x_ok = f"{x_expr} IS NOT NULL"
+        y_expr = f"{y_col}::float8"
+        y_ok = f"{y_expr} IS NOT NULL"
+        return (
+            f"CORR({x_expr}, {y_expr}) "
+            f"FILTER (WHERE {x_ok} AND {y_ok}) AS {_ident(out)}"
+        )
     if function == "percentile":
         if agg.percentile is None:
             raise SemanticCompileError("percentile requires a value")
@@ -496,6 +828,8 @@ def _agg_sql(
         )
     if function == "stddev":
         return f"STDDEV_POP({expr}){filter_sql} AS {_ident(out)}"
+    if function == "variance":
+        return f"VAR_POP({expr}){filter_sql} AS {_ident(out)}"
     fn = {"avg": "AVG", "sum": "SUM", "min": "MIN", "max": "MAX", "count": "COUNT"}
     sql_fn = fn.get(function)
     if sql_fn is None:
@@ -506,6 +840,8 @@ def _agg_sql(
 def _group_sql(
     alias: str, plan: SemanticQueryPlan, col_map: dict[str, str] | None = None
 ) -> str:
+    if "group_by_industrial_name" in (plan.assumptions or []):
+        return 'GROUP BY COALESCE(NULLIF(TRIM(ind."A8"), \'\'), NULLIF(TRIM(ind."A9"), \'\'))'
     if not plan.group_by:
         return ""
     cols = []
@@ -513,6 +849,10 @@ def _group_sql(
         _field, col = _field_col(alias, plan.entity, key, col_map)
         if key == "approval_date" and "approval_decade" in (plan.assumptions or []):
             cols.append(_approval_decade_expr(col))
+        elif key == "approval_date" and "approval_year_group" in (
+            plan.assumptions or []
+        ):
+            cols.append(f"({_approval_year_expr(col)})::int")
         elif _bin_expr_for(plan, key, col) is not None:
             cols.append(_bin_expr_for(plan, key, col))
         elif key == "sigungu_name" and plan.entity == "building":
@@ -525,14 +865,37 @@ def _group_sql(
 def _order_sql(
     alias: str, plan: SemanticQueryPlan, col_map: dict[str, str] | None = None
 ) -> str:
+    day_gap_order = next(
+        (
+            a
+            for a in (plan.assumptions or [])
+            if a.startswith("order_by_day_gap:")
+        ),
+        None,
+    )
+    if day_gap_order and plan.entity == "building":
+        direction = "DESC" if day_gap_order.endswith(":desc") else "ASC"
+        a33 = _semantic_date_col(alias, "permit_date", col_map)
+        a34 = _semantic_date_col(alias, "approval_date", col_map)
+        gap = f"({a34}::date - {a33}::date)"
+        return f"ORDER BY {gap} {direction} NULLS LAST"
     if not plan.order_by:
         return ""
     bits = []
     agg_aliases = {item.alias for item in plan.aggregations if item.alias}
     agg_aliases.update(item.alias for item in plan.ratios if item.alias)
+    # 비그룹 집계·count 에서 원 컬럼 ORDER BY 는 GroupingError
+    scalar_agg = (
+        plan.query_kind in {"aggregate", "distribution", "count"}
+        and not plan.group_by
+        and (plan.aggregations or plan.ratios or plan.query_kind == "count")
+    )
     for item in plan.order_by:
-        if item.field in agg_aliases or item.field in {"count", "n"}:
+        if item.field in agg_aliases or item.field in {"count", "n", "park"}:
             expr = _ident(item.field)
+        elif scalar_agg:
+            # count/비그룹 집계: 원컬럼 ORDER BY 는 생략 (GroupingError 방지)
+            continue
         else:
             field, expr = _field_col(alias, plan.entity, item.field, col_map)
             if item.field == "approval_date" and "approval_decade" in (plan.assumptions or []):
@@ -546,6 +909,8 @@ def _order_sql(
         direction = "DESC" if item.direction == "desc" else "ASC"
         nulls = "NULLS FIRST" if item.nulls == "first" else "NULLS LAST"
         bits.append(f"{expr} {direction} {nulls}")
+    if not bits:
+        return ""
     return "ORDER BY " + ", ".join(bits)
 
 
@@ -564,6 +929,11 @@ def _operand_sql(
             raise SemanticCompileError("field operand missing name")
         field, col = _field_col(alias, entity, operand.field, col_map)
         expr = f"{col}::float8" if field.data_type == "number" else col
+        if operand.scale is not None:
+            scale = float(operand.scale)
+            if scale <= 0 or scale > 1000:
+                raise SemanticCompileError(f"invalid operand scale: {scale}")
+            expr = f"({expr} * {scale:g})"
         return expr, operand.field == "height_m", []
     field_type = "number" if isinstance(operand.value, (int, float)) else "text"
     lit = _literal(operand.value, field_type)
@@ -681,7 +1051,16 @@ def _predicate_sql(
         if pred.operator == "neq":
             op = "IS DISTINCT FROM"
         elif pred.operator == "contains":
-            return f"{left_sql} ILIKE {_literal('%' + str(pred.right.value if pred.right else '') + '%', 'text')}", h1 or h2, p1 + p2
+            raw = str(pred.right.value if pred.right else "")
+            field_name = pred.left.field if pred.left else None
+            if field_name == "legal_dong" and raw.endswith(("동", "가", "리", "읍", "면")):
+                return (
+                    f"({left_sql} LIKE {_literal(f'% {raw}', 'text')} OR "
+                    f"{left_sql} = {_literal(raw, 'text')})",
+                    h1 or h2,
+                    p1 + p2,
+                )
+            return f"{left_sql} ILIKE {_literal('%' + raw + '%', 'text')}", h1 or h2, p1 + p2
         else:
             raise SemanticCompileError(f"unknown operator: {pred.operator}")
     return f"{left_sql} {op} {right_sql}", h1 or h2, p1 + p2
@@ -746,6 +1125,15 @@ def _filter_sql(
             mapped = STRUCTURE_ALIASES.get(pattern)
             if mapped:
                 return f"{col} ILIKE {_literal(mapped, 'text')}", height_used
+        if spec.field == "legal_dong" and isinstance(pattern, str):
+            # Avoid '%서동%' matching 구서동 — match token boundary.
+            name = pattern.strip()
+            if name.endswith(("동", "가", "리", "읍", "면")):
+                return (
+                    f"({col} LIKE {_literal(f'% {name}', 'text')} OR "
+                    f"{col} = {_literal(name, 'text')})",
+                    height_used,
+                )
         return f"{col} ILIKE {_literal(f'%{pattern}%', 'text')}", height_used
     if spec.field == "structure" and spec.operator == "neq" and isinstance(spec.value, str):
         mapped = STRUCTURE_ALIASES.get(spec.value) or f"%{spec.value}%"
@@ -760,14 +1148,20 @@ def _filter_sql(
         left = f"{col}::float8" if field.data_type == "number" else col
         if other.data_type == "number":
             right = f"{right}::float8"
+        if spec.value_scale is not None:
+            scale = float(spec.value_scale)
+            if scale <= 0 or scale > 1000:
+                raise SemanticCompileError(f"invalid value_scale: {scale}")
+            right = f"({right} * {scale:g})"
         op = _OPS.get(spec.operator)
         if op is None:
             raise SemanticCompileError(f"unknown operator: {spec.operator}")
         return f"{left} {op} {right}", height_used
     if spec.field == "structure" and spec.operator == "eq" and isinstance(spec.value, str):
-        mapped = STRUCTURE_ALIASES.get(spec.value)
-        if mapped and spec.value.endswith("구조"):
-            return f"{col} = {_literal(spec.value, 'text')}", height_used
+        raw = spec.value.strip()
+        if raw.endswith("구조"):
+            return f"{col} = {_literal(raw, 'text')}", height_used
+        mapped = STRUCTURE_ALIASES.get(raw)
         if mapped:
             return f"{col} ILIKE {_literal(mapped, 'text')}", height_used
     op = _OPS.get(spec.operator)
@@ -815,14 +1209,49 @@ def _apply_spatial_relations(
             if table not in tables:
                 tables.append(table)
             if target_entity == "industrial_complex":
-                exists = (
-                    f"EXISTS (SELECT 1 FROM {_ident(table, physical=True)} {d_alias} "
-                    f"WHERE {policy.postgis_fn}({alias}.geometry, {d_alias}.geometry)"
-                )
+                # Aggregate/count: JOIN so multi-park overlaps weight AVG; COUNT uses DISTINCT.
+                # List/rank: EXISTS to avoid duplicate primary rows.
+                use_join = plan.query_kind in {
+                    "aggregate",
+                    "distribution",
+                    "count",
+                } or bool(plan.aggregations or plan.ratios or plan.group_by)
+                sido_prefix = None
+                if plan.scope and plan.scope.place:
+                    from txt2sql.gazetteer import sido_pnu_prefix
+
+                    sido_name = canonical_sido(plan.scope.place.name) or (
+                        plan.scope.place.name
+                        if plan.scope.place.kind == "sido"
+                        else plan.scope.place.sido
+                    )
+                    if sido_name:
+                        sido_prefix = sido_pnu_prefix(sido_name)
+                extra_bits: list[str] = []
                 if name_clause and name_clause != "TRUE":
-                    exists += f" AND {name_clause}"
-                exists += ")"
-                where.append(exists)
+                    extra_bits.append(name_clause)
+                elif sido_prefix:
+                    extra_bits.append(
+                        f'{d_alias}."A4" LIKE '
+                        f"{_literal(str(sido_prefix) + '%', 'text')}"
+                    )
+                if use_join:
+                    joins.append(
+                        f"JOIN {_ident(table, physical=True)} {d_alias} "
+                        f"ON {policy.postgis_fn}({alias}.geometry, {d_alias}.geometry)"
+                    )
+                    where.extend(extra_bits)
+                else:
+                    exists = (
+                        f"EXISTS (SELECT 1 FROM {_ident(table, physical=True)} {d_alias} "
+                        f"WHERE {policy.postgis_fn}({alias}.geometry, {d_alias}.geometry)"
+                    )
+                    for bit in extra_bits:
+                        exists += f" AND {bit}"
+                    exists += ")"
+                    where.append(exists)
+                uses_boundary = True
+                continue
             else:
                 joins.append(
                     f"JOIN {_ident(table, physical=True)} {d_alias} "
@@ -966,11 +1395,23 @@ def _apply_canonical_joins(
         elif edge.edge_id == "building_in_industrial":
             if INDUSTRIAL_TABLE not in tables:
                 tables.append(INDUSTRIAL_TABLE)
-            if not any(INDUSTRIAL_TABLE in item for item in joins):
-                joins.append(
-                    f"JOIN {_ident(INDUSTRIAL_TABLE, physical=True)} ind "
-                    f"ON ST_Intersects({alias}.geometry, ind.geometry)"
-                )
+            use_join = plan.query_kind in {
+                "aggregate",
+                "distribution",
+                "count",
+            } or bool(plan.aggregations or plan.ratios or plan.group_by)
+            if use_join:
+                if not any(INDUSTRIAL_TABLE in item for item in joins):
+                    joins.append(
+                        f"JOIN {_ident(INDUSTRIAL_TABLE, physical=True)} ind "
+                        f"ON ST_Intersects({alias}.geometry, ind.geometry)"
+                    )
+            else:
+                if not any("EXISTS" in item and "ind" in item for item in where):
+                    where.append(
+                        f'EXISTS (SELECT 1 FROM {_ident(INDUSTRIAL_TABLE, physical=True)} ind '
+                        f"WHERE ST_Intersects({alias}.geometry, ind.geometry))"
+                    )
         else:
             raise SemanticCompileError(f"uncompiled join edge: {edge.edge_id}")
 
@@ -1001,9 +1442,18 @@ def _adm_cd_sql(alias: str, place_name: str | None, plan=None) -> str | None:
     gu = None
     if plan is not None and plan.scope and plan.scope.place:
         spec = plan.scope.place
-        if spec.kind == "sido":
+        if getattr(spec, "sido", None):
+            sido = spec.sido
+        if getattr(spec, "sigungu", None):
+            gu = spec.sigungu
+        if getattr(spec, "code", None) and place_name and spec.kind in {
+            "gu",
+            "sigungu",
+        }:
+            return f'{alias}."ADM_CD" LIKE {_literal(spec.code + "%", "text")}'
+        if spec.kind == "sido" and not sido:
             sido = spec.name
-        elif spec.kind in {"gu", "sigungu"}:
+        elif spec.kind in {"gu", "sigungu"} and not gu:
             gu = spec.name
     prefix = adm_cd_prefix_for_place(place_name, sido=sido, gu=gu)
     if not prefix:
@@ -1023,6 +1473,8 @@ def _plan_sido_context(plan=None) -> str | None:
     if plan is None or not plan.scope or not plan.scope.place:
         return None
     spec = plan.scope.place
+    if getattr(spec, "sido", None):
+        return spec.sido
     if spec.kind == "sido":
         return spec.name
     return None
@@ -1130,21 +1582,60 @@ def _plan_uses_d198_slots(plan: SemanticQueryPlan) -> bool:
         for node in walk_predicate(pred):
             if node.op == "cmp" and node.left and node.left.field:
                 fields.add(node.left.field)
-    d198_fields = {
+    d198_exclusive = {
         "detail_usage",
         "usage_class",
         "ledger_kind",
+        "complex_building_kind",
         "permit_date",
-        "approval_date",
-        "building_age_years",
     }
+    d010_native = {
+        "ground_floors",
+        "basement_floors",
+        "height_m",
+        "gross_floor_area_m2",
+        "building_area_m2",
+        "site_area_m2",
+        "building_coverage_ratio",
+        "floor_area_ratio",
+        "structure",
+        "usage",
+        "violation_status",
+        "special_land",
+    }
+    temporal_fields = {"approval_date", "building_age_years"}
     if (
         plan.query_kind == "count"
         and fields <= {"usage_class"}
         and "d198_ledger" not in (plan.assumptions or [])
     ):
         return False
-    return bool(fields & d198_fields)
+    if fields & d198_exclusive:
+        return True
+    from txt2sql.domain import assumptions_include_permit_lag
+
+    # Temporal + D010-native metrics → stay on D010 (A13/A26), not D198 ledger columns.
+    if (
+        fields & temporal_fields
+        and fields & d010_native
+        and not assumptions_include_permit_lag(plan.assumptions)
+    ):
+        return False
+    if fields & temporal_fields:
+        return True
+    if assumptions_include_permit_lag(plan.assumptions):
+        return True
+    for ratio in plan.ratios or []:
+        for pred in (ratio.numerator_predicate, ratio.denominator_predicate):
+            if pred is None:
+                continue
+            for node in walk_predicate(pred):
+                if node.op == "cmp" and node.left and node.left.field:
+                    if node.left.field in d198_exclusive | temporal_fields:
+                        return True
+                    if node.right and node.right.field in d198_exclusive | temporal_fields:
+                        return True
+    return False
 
 
 def _d198_table_for_plan(plan: SemanticQueryPlan) -> str | None:
@@ -1163,9 +1654,21 @@ def _d198_table_for_plan(plan: SemanticQueryPlan) -> str | None:
             f.field in {"approval_date", "building_age_years"}
             for f in plan.filters
         ) and not any(
-            f.field in {"detail_usage", "usage_class", "ledger_kind", "permit_date"}
+            f.field
+            in {
+                "detail_usage",
+                "usage_class",
+                "ledger_kind",
+                "complex_building_kind",
+                "permit_date",
+            }
             for f in plan.filters
         ):
+            return None
+        # also allow day-gap without exclusive filters to resolve table via dong→gu
+        from txt2sql.domain import assumptions_include_permit_lag
+
+        if assumptions_include_permit_lag(plan.assumptions):
             return None
         raise SemanticCompileError(
             "detail_usage/usage_class require a D198-covered district"
@@ -1179,8 +1682,8 @@ def _column_override(plan: SemanticQueryPlan) -> dict[str, str]:
     return {}
 
 
-def _col(alias: str, column: str) -> str:
-    return f"{alias}.{_ident(column, physical=True)}"
+def _col(alias: str, column: str, *, physical: bool = True) -> str:
+    return f"{alias}.{_ident(column, physical=physical)}"
 
 
 _SQL_WORDS = frozenset(
@@ -1269,6 +1772,15 @@ def _approval_decade_expr(col: str) -> str:
 
 
 def _bin_expr_for(plan: SemanticQueryPlan, key: str, col: str) -> str | None:
+    # Prefer explicit BinSpec over legacy width_bucket assumptions.
+    for spec in getattr(plan, "bins", None) or []:
+        if spec.field != key:
+            continue
+        if spec.edges and len(spec.edges) >= 2:
+            return _edges_bin_case(col, list(spec.edges), list(spec.labels or []))
+        if spec.width is not None and float(spec.width) > 0:
+            w = sql_number(float(spec.width))
+            return f"(FLOOR(({col})::float8 / {w}) * {w})"
     for item in plan.assumptions or []:
         if not item.startswith("width_bucket:"):
             continue
@@ -1286,8 +1798,50 @@ def _bin_expr_for(plan: SemanticQueryPlan, key: str, col: str) -> str | None:
     return None
 
 
+def _edges_bin_case(col: str, edges: list[float], labels: list[str]) -> str:
+    """Cutpoint bins. 2 edges → (-inf,e0) / [e0,e1] / (e1,+inf). Else left-closed intervals."""
+    sorted_edges = sorted(float(e) for e in edges)
+    if len(sorted_edges) < 2:
+        return f"({col})::float8"
+    # Explicit 3-way split used by「미만 / 중간 / 초과」questions.
+    if len(sorted_edges) == 2 and len(labels) >= 3:
+        lo, hi = sorted_edges[0], sorted_edges[1]
+        return (
+            "(CASE "
+            f"WHEN ({col})::float8 < {sql_number(lo)} THEN {_literal(labels[0], 'text')} "
+            f"WHEN ({col})::float8 <= {sql_number(hi)} THEN {_literal(labels[1], 'text')} "
+            f"ELSE {_literal(labels[2], 'text')} END)"
+        )
+    branches: list[str] = []
+    for i in range(len(sorted_edges) - 1):
+        lo = sorted_edges[i]
+        hi = sorted_edges[i + 1]
+        label = labels[i] if i < len(labels) else f"{lo:g}_{hi:g}"
+        lit = _literal(label, "text")
+        branches.append(
+            f"WHEN ({col})::float8 >= {sql_number(lo)} "
+            f"AND ({col})::float8 < {sql_number(hi)} THEN {lit}"
+        )
+    last_lo = sorted_edges[-1]
+    last_label = (
+        labels[len(sorted_edges) - 1]
+        if len(labels) >= len(sorted_edges)
+        else f"{last_lo:g}_inf"
+    )
+    branches.append(
+        f"WHEN ({col})::float8 >= {sql_number(last_lo)} "
+        f"THEN {_literal(last_label, 'text')}"
+    )
+    return "(CASE " + " ".join(branches) + " ELSE NULL END)"
+
+
 def _approval_date_sql(col: str, spec: FilterSpec) -> str:
     """사용승인일 텍스트 컬럼을 연도 또는 날짜로 비교한다."""
+    if spec.operator == "is_null":
+        return f"{col} IS NULL"
+    if spec.operator == "is_not_null":
+        # 「기록된」→ ISO 날짜가 있는 행 (골드 grain과 동일)
+        return f"{col}::text ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'"
     year_expr = _approval_year_expr(col)
     valid = f"({col}::text ~ '^[0-9]{{4}}')"
     op = _OPS.get(spec.operator)
@@ -1326,8 +1880,8 @@ def _approval_date_sql(col: str, spec: FilterSpec) -> str:
 
 def _assert_safe_sql(sql: str) -> str:
     lower = " ".join(sql.lower().split())
-    if not lower.startswith("select"):
-        raise SemanticCompileError("compiled SQL must be SELECT")
+    if not (lower.startswith("select") or lower.startswith("with")):
+        raise SemanticCompileError("compiled SQL must be SELECT or WITH")
     for word in ("insert", "update", "delete", "drop", "alter", "truncate"):
         if f" {word} " in f" {lower} ":
             raise SemanticCompileError(f"forbidden keyword: {word}")

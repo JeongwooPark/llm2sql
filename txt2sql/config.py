@@ -77,6 +77,27 @@ class Settings:
     reference_date: str = "2026-08-27"
     # 동명 구(중구 등) PNU·활성 시·도 테이블 선택 기본값 (전국 확장 시 환경변수로 변경).
     default_sido: str = "부산광역시"
+    # --- Security (P0) ---
+    # local: loopback-only, implicit admin. token: require Bearer + separated DB roles.
+    security_mode: str = "local"
+    api_user_token: str = ""
+    api_admin_token: str = ""
+    trusted_hosts: tuple[str, ...] = ("127.0.0.1", "localhost")
+    allowed_origins: tuple[str, ...] = ()
+    trust_proxy_headers: bool = False
+    database_url_query: str = ""
+    database_url_map: str = ""
+    database_url_admin: str = ""
+    session_ttl_seconds: int = 3600
+    session_max_count: int = 200
+    max_question_chars: int = 4000
+    max_concurrent_asks: int = 4
+    upload_csv_max_bytes: int = 2_000_000
+    upload_zip_max_bytes: int = 50 * 1024 * 1024
+    upload_zip_max_entries: int = 64
+    upload_zip_max_uncompressed: int = 200 * 1024 * 1024
+    log_sql_in_production: bool = False
+    allow_remote_ollama_samples: bool = False
 
     def planner_model(self) -> str:
         return (self.ollama_plan_model or self.ollama_model).strip()
@@ -299,17 +320,135 @@ class Settings:
                 )
             ).strip()
             or "부산광역시",
+            security_mode=_security_mode(
+                _pick(data, "security_mode", "SECURITY_MODE", default="local")
+            ),
+            api_user_token=str(
+                _pick(data, "api_user_token", "API_USER_TOKEN", default="")
+            ),
+            api_admin_token=str(
+                _pick(data, "api_admin_token", "API_ADMIN_TOKEN", default="")
+            ),
+            trusted_hosts=_csv_tuple(
+                _pick(
+                    data,
+                    "trusted_hosts",
+                    "TRUSTED_HOSTS",
+                    default="127.0.0.1,localhost",
+                )
+            ),
+            allowed_origins=_csv_tuple(
+                _pick(data, "allowed_origins", "ALLOWED_ORIGINS", default="")
+            ),
+            trust_proxy_headers=_as_bool(
+                _pick(data, "trust_proxy_headers", "TRUST_PROXY_HEADERS"),
+                False,
+            ),
+            database_url_query=str(
+                _pick(data, "database_url_query", "DATABASE_URL_QUERY", default="")
+            ).strip(),
+            database_url_map=str(
+                _pick(data, "database_url_map", "DATABASE_URL_MAP", default="")
+            ).strip(),
+            database_url_admin=str(
+                _pick(data, "database_url_admin", "DATABASE_URL_ADMIN", default="")
+            ).strip(),
+            session_ttl_seconds=int(
+                _pick(data, "session_ttl_seconds", "SESSION_TTL_SECONDS", default=3600)
+            ),
+            session_max_count=int(
+                _pick(data, "session_max_count", "SESSION_MAX_COUNT", default=200)
+            ),
+            max_question_chars=int(
+                _pick(data, "max_question_chars", "MAX_QUESTION_CHARS", default=4000)
+            ),
+            max_concurrent_asks=int(
+                _pick(data, "max_concurrent_asks", "MAX_CONCURRENT_ASKS", default=4)
+            ),
+            upload_csv_max_bytes=int(
+                _pick(
+                    data,
+                    "upload_csv_max_bytes",
+                    "UPLOAD_CSV_MAX_BYTES",
+                    default=2_000_000,
+                )
+            ),
+            upload_zip_max_bytes=int(
+                _pick(
+                    data,
+                    "upload_zip_max_bytes",
+                    "UPLOAD_ZIP_MAX_BYTES",
+                    default=50 * 1024 * 1024,
+                )
+            ),
+            upload_zip_max_entries=int(
+                _pick(
+                    data,
+                    "upload_zip_max_entries",
+                    "UPLOAD_ZIP_MAX_ENTRIES",
+                    default=64,
+                )
+            ),
+            upload_zip_max_uncompressed=int(
+                _pick(
+                    data,
+                    "upload_zip_max_uncompressed",
+                    "UPLOAD_ZIP_MAX_UNCOMPRESSED",
+                    default=200 * 1024 * 1024,
+                )
+            ),
+            log_sql_in_production=_as_bool(
+                _pick(data, "log_sql_in_production", "LOG_SQL_IN_PRODUCTION"),
+                False,
+            ),
+            allow_remote_ollama_samples=_as_bool(
+                _pick(
+                    data,
+                    "allow_remote_ollama_samples",
+                    "ALLOW_REMOTE_OLLAMA_SAMPLES",
+                ),
+                False,
+            ),
         )
+
+
+def _security_mode(raw: object) -> str:
+    mode = str(raw or "local").strip().lower()
+    if mode not in {"local", "token"}:
+        raise ValueError(
+            f"SECURITY_MODE must be 'local' or 'token' (got {raw!r})"
+        )
+    return mode
+
+
+def _csv_tuple(raw: object) -> tuple[str, ...]:
+    text = str(raw or "").strip()
+    if not text:
+        return ()
+    return tuple(part.strip() for part in text.split(",") if part.strip())
+
+
+def database_url_for(settings: Settings, role: str = "query") -> str:
+    """Return role-specific DB URL with fallback to DATABASE_URL (local only)."""
+    if role == "map":
+        return (settings.database_url_map or settings.database_url).strip()
+    if role == "admin":
+        return (settings.database_url_admin or settings.database_url).strip()
+    return (settings.database_url_query or settings.database_url).strip()
 
 
 def load_settings(*, dotenv: bool = True) -> Settings:
     if dotenv:
         load_dotenv()
     try:
-        return Settings.from_mapping(dict(os.environ))
+        settings = Settings.from_mapping(dict(os.environ))
     except ValueError as exc:
         if "database_url" in str(exc).lower():
             raise ValueError(
                 "DATABASE_URL이 설정되지 않았습니다. .env 파일을 확인하세요."
             ) from exc
         raise
+    from txt2sql.security.deploy import validate_security_settings
+
+    validate_security_settings(settings)
+    return settings

@@ -69,6 +69,29 @@ def test_repair_plan_from_contract_missing_predicate() -> None:
     assert "height_m" in fields
 
 
+def test_repair_boolean_not_dropped() -> None:
+    q = "동래구 공장 또는 창고를 제외한 건물 수"
+    contract = extract_contract(q)
+    plan = SemanticQueryPlan.model_validate(
+        {
+            "version": "1.0",
+            "query_kind": "count",
+            "entity": "building",
+            "scope": {"place": {"name": "동래구", "kind": "gu"}},
+            "filters": [
+                FilterSpec(field="usage", operator="eq", value="공장").model_dump()
+            ],
+        }
+    )
+    repaired = repair_plan_from_contract(
+        plan, contract, ["BOOLEAN_NOT_DROPPED", "P04"], q
+    )
+    from txt2sql.semantic_plan.predicate_utils import effective_predicate, has_op
+
+    pred = effective_predicate(repaired)
+    assert has_op(pred, "not") or any(f.operator == "neq" for f in repaired.filters)
+
+
 def test_contract_is_executable_query() -> None:
     from txt2sql.query_contract import contract_is_executable_query
 

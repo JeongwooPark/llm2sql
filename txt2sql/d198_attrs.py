@@ -509,6 +509,10 @@ def looks_like_year_stats_question(question: str) -> bool:
     q = _normalize_usage_typos(question.strip())
     if not q:
         return False
+    # 목록·보여주기(특정 년대 필터)는 연도 분포 통계가 아님
+    if any(k in q for k in ("보여줘", "보여 줘", "목록", "리스트", "나열", "찾아줘", "찾아 줘")):
+        if re.search(r"((?:19|20)\d{2})\s*년대", q) and "별" not in q:
+            return False
     if re.search(r"년대인", q) or (
         re.search(r"((?:19|20)\d{2})\s*년대", q)
         and any(k in q for k in ("몇 채", "몇채", "채수", "건수", "것은 몇"))
@@ -518,8 +522,8 @@ def looks_like_year_stats_question(question: str) -> bool:
     ):
         return False
     countish = any(
-        k in q for k in ("수", "몇", "건수", "채수", "통계", "분포")
-    )
+        k in q for k in ("몇", "건수", "채수", "통계", "분포", "년도별", "연도별", "년대별")
+    ) or bool(re.search(r"(?<![가-힣])수(?![가-힣])", q)) or "건물 수" in q or "건물수" in q
     grain = year_stats_grain(q)
     by_year = grain == 1 or any(k in q for k in YEAR_GRAIN_HINTS)
     by_bin = grain is not None and grain >= 2

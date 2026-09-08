@@ -10,7 +10,7 @@ from typing import Any
 
 import psycopg
 
-from txt2sql.config import Settings
+from txt2sql.config import Settings, database_url_for
 from txt2sql.db import assert_readonly_sql, connect
 from txt2sql.map.geoserver import GeoServerClient
 from txt2sql.map.labels import infer_label_field, labels_for_layer
@@ -39,7 +39,7 @@ def layer_is_published(settings: Settings, layer: str) -> bool:
         return False
     try:
         schema = _valid_schema(settings.map_schema)
-        with connect(settings.database_url) as conn:
+        with connect(database_url_for(settings, "map")) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -115,7 +115,7 @@ def _publish_plan(
     schema = _valid_schema(settings.map_schema)
     layer = f"temp_{uuid.uuid4().hex[:16]}"
     assert_readonly_sql(plan.sql if plan.sql.rstrip().endswith(";") else plan.sql + ";")
-    with connect(settings.database_url) as conn:
+    with connect(database_url_for(settings, "map")) as conn:
         _ensure_schema(conn, schema)
         _create_temp_table(conn, schema, layer, plan.sql)
         geom_meta = _prepare_geometry(conn, schema, layer)
@@ -138,7 +138,7 @@ def _publish_plan(
         title=plan.title,
     )
     if not created:
-        with connect(settings.database_url) as conn:
+        with connect(database_url_for(settings, "map")) as conn:
             _drop_table(conn, schema, layer)
             conn.commit()
         return {
@@ -192,7 +192,7 @@ def fetch_layer_attributes(
         raise ValueError("허용되지 않은 레이어 이름입니다.")
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
-    with connect(settings.database_url) as conn:
+    with connect(database_url_for(settings, "map")) as conn:
         table = _resolve_table_name(conn, schema, table)
         cols = _attribute_columns(conn, schema, table)
         if not cols:
@@ -224,14 +224,48 @@ def fetch_layer_attributes(
     }
 
 
-def delete_published_layer(settings: Settings, layer: str) -> bool:
+def layer_owner_session(settings: Settings, layer: str) -> str | None:
+    """Return owning session_id for a temp layer, if tracked."""
+    if not is_safe_layer_name(layer):
+        return None
+    schema = _valid_schema(settings.map_schema)
+    try:
+        with connect(database_url_for(settings, "map")) as conn:
+            _ensure_schema(conn, schema)
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT session_id FROM {schema}.layer_sessions WHERE layer_name = %s",
+                    (layer,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                sid = str(row.get("session_id") or "").strip()
+                return sid or None
+    except Exception:
+        return None
+
+
+def delete_published_layer(
+    settings: Settings,
+    layer: str,
+    *,
+    session_id: str | None = None,
+    enforce_owner: bool = False,
+) -> bool:
     if not is_safe_layer_name(layer):
         raise ValueError("허용되지 않은 레이어 이름입니다.")
     schema = _valid_schema(settings.map_schema)
+    if enforce_owner:
+        if not is_safe_session_id(session_id):
+            raise ValueError("세션 소유권 확인이 필요합니다.")
+        owner = layer_owner_session(settings, layer)
+        if owner is not None and owner != session_id:
+            raise ValueError("이 세션이 소유하지 않은 레이어입니다.")
     client = GeoServerClient(settings)
     if client.enabled:
         client.delete_layer(layer)
-    with connect(settings.database_url) as conn:
+    with connect(database_url_for(settings, "map")) as conn:
         _drop_table(conn, schema, layer)
         with conn.cursor() as cur:
             cur.execute(
@@ -249,7 +283,7 @@ def cleanup_session_layers(settings: Settings, session_id: str) -> int:
     schema = _valid_schema(settings.map_schema)
     client = GeoServerClient(settings)
     removed = 0
-    with connect(settings.database_url) as conn:
+    with connect(database_url_for(settings, "map")) as conn:
         _ensure_schema(conn, schema)
         with conn.cursor() as cur:
             cur.execute(
@@ -280,7 +314,7 @@ def trim_session_layers(settings: Settings, session_id: str, *, keep: int) -> li
     schema = _valid_schema(settings.map_schema)
     client = GeoServerClient(settings)
     evicted: list[str] = []
-    with connect(settings.database_url) as conn:
+    with connect(database_url_for(settings, "map")) as conn:
         _ensure_schema(conn, schema)
         with conn.cursor() as cur:
             cur.execute(
@@ -314,7 +348,7 @@ def cleanup_expired_layers(settings: Settings, *, force: bool = False) -> int:
     hours = max(1, int(settings.map_retention_hours or 24))
     client = GeoServerClient(settings)
     removed = 0
-    with connect(settings.database_url) as conn:
+    with connect(database_url_for(settings, "map")) as conn:
         _ensure_schema(conn, schema)
         with conn.cursor() as cur:
             if force:

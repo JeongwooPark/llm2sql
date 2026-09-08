@@ -143,18 +143,17 @@ def _enrich_d198_from_nl(data: QueryIR, question: str | None) -> None:
     """Map NL usage terms to D198 filters (aggregate scalars only)."""
     if not question or data.task != "aggregate":
         return
-    from txt2sql.domain import extract_detail_usages, extract_place
+    from txt2sql.domain import (
+        extract_detail_usages,
+        extract_place,
+        extract_usage_classes,
+    )
 
     details = extract_detail_usages(question)
     if details:
-        detail_set = set(details)
+        # Detail usage wins: drop main-usage predicates that would AND with A25.
         data.predicates = [
-            p
-            for p in data.predicates
-            if not (
-                p.field in {"usage", "detail_usage"}
-                and str(p.value) in detail_set
-            )
+            p for p in data.predicates if p.field not in {"usage", "detail_usage"}
         ]
         for term in details:
             field = "detail_usage" if term in D198_A27_TERMS else "usage"
@@ -165,6 +164,18 @@ def _enrich_d198_from_nl(data: QueryIR, question: str | None) -> None:
                     PredicateIR(field=field, operator="eq", value=term)
                 )
 
+    classes = extract_usage_classes(question)
+    if len(classes) == 1:
+        data.predicates = [p for p in data.predicates if p.field != "usage_class"]
+        term = classes[0]
+        if not any(
+            p.field == "usage_class" and str(p.value) == term for p in data.predicates
+        ):
+            data.predicates.append(
+                PredicateIR(field="usage_class", operator="eq", value=term)
+            )
+    # len>=2: compare/OR 는 SP FILTER·group 경로에 맡기고 AND 하지 않음
+
     place = extract_place(question) or (data.scope.place if data.scope else None)
     if place and str(place).endswith(("동", "가", "리")):
         data.predicates = [p for p in data.predicates if p.field != "legal_dong"]
@@ -174,17 +185,73 @@ def _enrich_d198_from_nl(data: QueryIR, question: str | None) -> None:
             data.scope = data.scope.model_copy(update={"place": str(place)})
 
 
-def _parse_percentile_tail(question: str) -> tuple[float, str, str] | None:
-    """상위 N% … 평균 X 패턴 → (percentile_cont, rank_field, agg_field)."""
+def _parse_percentile_tail(question: str) -> tuple[float, str, str, str] | None:
+    """상위/오래된/하위 N% … 평균 X → (percentile_cont, rank_field, agg_field, side).
+
+    side: ``high`` = rank >= cut (최근/상위), ``low`` = rank <= cut (가장 오래된·하위·빠른).
+    Also supports 「최근 준공 상위 N% … 평균」→ rank by approval year.
+    """
     q = question or ""
-    m = re.search(r"상위\s*(\d+(?:\.\d+)?)\s*%\s*", q)
+    oldest = bool(
+        re.search(r"가장\s*오래된|제일\s*오래된|오래된\s*건물", q)
+    )
+    low_tail = oldest or bool(
+        re.search(
+            r"하위\s*\d|준공연도가?\s*빠른|사용승인(?:연도|일)?가?\s*빠른|"
+            r"빠른\s*하위|연도가?\s*빠른\s*하위",
+            q,
+        )
+    )
+    m = re.search(r"(?:상위|하위)\s*(\d+(?:\.\d+)?)\s*%\s*", q)
+    if m is None:
+        # 「최근 준공 5%」「가장 오래된 건물 1%」「준공연도가 빠른 하위 10%」
+        m = re.search(
+            r"(?:최근\s*준공|최근준공|최근\s*사용승인|가장\s*오래된|제일\s*오래된|"
+            r"오래된\s*건물|준공연도가?\s*빠른|사용승인(?:연도|일)?가?\s*빠른|"
+            r"하위)\s*(?:된\s*)?(?:건물\s*)?(?:상위\s*|하위\s*)?(\d+(?:\.\d+)?)\s*%",
+            q,
+        )
+    if m is None:
+        m = re.search(r"(?:건물\s*)?(\d+(?:\.\d+)?)\s*%\s*의\s*평균", q)
+        if m and not low_tail and "최근" not in q and "상위" not in q:
+            m = None
     if not m or "평균" not in q:
         return None
     top_pct = float(m.group(1))
     if top_pct <= 0 or top_pct >= 100:
         return None
-    pct = round(1.0 - top_pct / 100.0, 6)
 
+    # 최근 준공/사용승인 연도 꼬리 또는 가장 오래된·하위·빠른 연도 꼬리
+    year_tail = low_tail or any(
+        k in q
+        for k in (
+            "최근 준공",
+            "최근준공",
+            "최근 사용승인",
+            "준공 상위",
+            "사용승인 상위",
+            "준공연도",
+            "사용승인연도",
+        )
+    )
+    if year_tail:
+        rank_field = "approval_date"
+        agg_field = None
+        if any(k in q for k in ("평균 건축물면적", "평균 건축면적", "평균 건물면적")):
+            agg_field = "building_area_m2"
+        elif "평균 연면적" in q:
+            agg_field = "gross_floor_area_m2"
+        elif "평균 높이" in q or ("평균" in q and "높이" in q):
+            agg_field = "height_m"
+        elif any(k in q for k in ("평균 지상층", "평균 층", "지상층수")):
+            agg_field = "ground_floors"
+        if agg_field is None:
+            return None
+        if low_tail:
+            return round(top_pct / 100.0, 6), rank_field, agg_field, "low"
+        return round(1.0 - top_pct / 100.0, 6), rank_field, agg_field, "high"
+
+    pct = round(1.0 - top_pct / 100.0, 6)
     rank_field = (
         "height_m"
         if "높이" in q and "연면적" not in q.split("평균")[0]
@@ -205,14 +272,18 @@ def _parse_percentile_tail(question: str) -> tuple[float, str, str] | None:
     agg_field = None
     if "평균 연면적" in q or "평균 건축면적" in q:
         agg_field = "gross_floor_area_m2"
-    elif "평균 지상층" in q or "평균 층" in q:
+    elif any(k in q for k in ("평균 건축물면적", "평균 건물면적")):
+        agg_field = "building_area_m2"
+    elif any(k in q for k in ("평균 지상층", "평균 층", "지상층수")):
         agg_field = "ground_floors"
     elif "평균 높이" in q:
         agg_field = "height_m"
 
     if rank_field is None or agg_field is None or rank_field == agg_field:
         return None
-    return pct, rank_field, agg_field
+    if low_tail and not year_tail:
+        return round(top_pct / 100.0, 6), rank_field, agg_field, "low"
+    return pct, rank_field, agg_field, "high"
 
 
 def _compile_percentile_tail_sql(
@@ -222,13 +293,22 @@ def _compile_percentile_tail_sql(
     rank_field: str,
     agg_field: str,
     plan: SemanticQueryPlan,
+    side: str = "high",
 ) -> str:
-    """Percentile-threshold tail aggregate (Q191/Q192/Q298-class)."""
-    use_d198 = "d198_ledger" in (plan.assumptions or []) or any(
-        f.field in {"detail_usage", "usage", "usage_class"} for f in plan.filters
+    """Percentile-threshold tail aggregate (Q191/Q192/Q298/Q334-class)."""
+    use_d198 = (
+        "d198_ledger" in (plan.assumptions or [])
+        or rank_field in {"approval_date", "permit_date", "building_age_years"}
+        or any(
+            f.field in {"detail_usage", "usage", "usage_class", "approval_date"}
+            for f in plan.filters
+        )
     )
     col_map = D198_FIELD_COLUMNS if use_d198 else D010_FIELD_COLUMNS
-    rank_col = col_map[rank_field]
+    if rank_field == "approval_date":
+        rank_col = col_map.get("approval_date") or col_map.get("building_age_years")
+    else:
+        rank_col = col_map[rank_field]
     agg_col = col_map[agg_field]
 
     if use_d198:
@@ -238,12 +318,20 @@ def _compile_percentile_tail_sql(
     else:
         table = get_entity("building").default_table
 
-    rank_expr = f'NULLIF(TRIM(b."{rank_col}"::text), \'\')::float8'
+    if rank_field == "approval_date":
+        # Gold: year from approval date text; recent tail = high years
+        rank_expr = (
+            f"LEFT(regexp_replace(b.\"{rank_col}\"::text, '[^0-9]', '', 'g'), 4)::int"
+        )
+        rank_null = f"b.\"{rank_col}\"::text ~ '^[0-9]{{4}}'"
+    else:
+        rank_expr = f'NULLIF(TRIM(b."{rank_col}"::text), \'\')::float8'
+        rank_null = f"{rank_expr} IS NOT NULL"
     agg_expr = f'NULLIF(TRIM(b."{agg_col}"::text), \'\')::float8'
     pct_sql = f"{pct:g}"
 
     where_parts = [
-        f"{rank_expr} IS NOT NULL",
+        rank_null,
         f"{agg_expr} IS NOT NULL",
     ]
     if rank_field == "height_m" and not use_d198:
@@ -254,14 +342,35 @@ def _compile_percentile_tail_sql(
 
     for filt in plan.filters:
         if filt.field == "usage" and filt.operator == "eq":
-            where_parts.append(f'b."A25" = {_sql_lit(filt.value)}')
+            col = "A25" if use_d198 else "A9"
+            where_parts.append(f'b."{col}" = {_sql_lit(filt.value)}')
         elif filt.field == "detail_usage" and filt.operator == "eq":
             where_parts.append(f'b."A27" = {_sql_lit(filt.value)}')
+        elif filt.field == "legal_dong" and filt.operator == "contains":
+            where_parts.append(
+                f'(b."A4" LIKE {_sql_lit("% " + str(filt.value))} '
+                f'OR b."A4" = {_sql_lit(filt.value)})'
+            )
+
+    # Gu scope from plan (A3 prefix)
+    if plan.scope and plan.scope.place and plan.scope.place.kind == "gu":
+        from txt2sql.gazetteer import sigungu_a3_prefix
+
+        prefix = sigungu_a3_prefix(plan.scope.place.name)
+        if prefix:
+            where_parts.append(f'b."A3" LIKE {_sql_lit(prefix + "%")}')
 
     where_sql = " AND ".join(where_parts)
-    rank_alias = "gfa" if rank_field == "gross_floor_area_m2" else "h"
+    rank_alias = (
+        "y"
+        if rank_field == "approval_date"
+        else "gfa"
+        if rank_field == "gross_floor_area_m2"
+        else "h"
+    )
     agg_alias = "fl" if agg_field == "ground_floors" else "v"
     avg_alias = f"avg_{agg_field}"
+    cmp = "<=" if side == "low" else ">="
 
     return f"""WITH base AS (
   SELECT {rank_expr} AS {rank_alias}, {agg_expr} AS {agg_alias}
@@ -271,7 +380,7 @@ def _compile_percentile_tail_sql(
   SELECT PERCENTILE_CONT({pct_sql}) WITHIN GROUP (ORDER BY {rank_alias}) AS cut FROM base
 )
 SELECT AVG({agg_alias}) AS "{avg_alias}", COUNT(*)::bigint AS "n", (SELECT cut FROM p) AS "cut"
-FROM base, p WHERE {rank_alias} >= p.cut"""
+FROM base, p WHERE {rank_alias} {cmp} p.cut"""
 
 
 def _sql_lit(value: object) -> str:
@@ -323,54 +432,22 @@ def _apply_dataset_assumptions(
     refined: QueryIR,
     question: str | None = None,
 ) -> None:
-    """PhysicalPlan wins over NL heuristics for dataset selection."""
+    """Apply D010/D198 grain from the central policy only.
+
+    MAIN485 §4.3: router / QueryIR physical / SQP / compiler share one grain
+    decision. A PhysicalPlan hint must not override coverage+usage → D198
+    (or exclusive ledger fields) with D010 — that was the Phase6→P012 −15
+    mass regression (A25→A9).
+    """
     from txt2sql.dataset_grain import grain_to_assumption, resolve_dataset_grain
 
-    notes = list(plan.assumptions or [])
-    phys_notes = physical_to_dataset_assumptions(physical, logical)
-
-    if phys_notes:
-        if "d010_gis" in phys_notes:
-            notes = [n for n in notes if n != "d198_ledger"]
-            if "d010_gis" not in notes:
-                notes.append("d010_gis")
-            plan.assumptions = notes
-            return
-        if "d198_ledger" in phys_notes:
-            if "d198_ledger" not in notes:
-                notes.append("d198_ledger")
-            plan.assumptions = notes
-            return
-
-    if physical is not None:
-        grain = resolve_dataset_grain(refined, question or "")
-        assumption = grain_to_assumption(grain)
-        if assumption == "d010_gis":
-            notes = [n for n in notes if n != "d198_ledger"]
-            if "d010_gis" not in notes:
-                notes.append("d010_gis")
-        elif assumption == "d198_ledger" and "d198_ledger" not in notes:
-            notes.append("d198_ledger")
-        plan.assumptions = notes
-        return
-
-    # No physical plan: legacy NL heuristics only.
-    if any(
-        p.field in {"approval_date", "permit_date", "building_age_years"}
-        for p in refined.predicates
-    ) or (
-        refined.temporal
-        and refined.temporal.field in {"approval_date", "permit_date", "building_age_years"}
-    ):
-        if "d198_ledger" not in notes:
-            notes.append("d198_ledger")
-    usage_fields = {p.field for p in refined.predicates} & {"usage", "detail_usage"}
-    if usage_fields:
-        bare_main_usage = "usage" in usage_fields and "detail_usage" not in usage_fields
-        if refined.task in {"list", "rank", "count"} and bare_main_usage:
-            notes = [n for n in notes if n != "d198_ledger"]
-        elif "d198_ledger" not in notes:
-            notes.append("d198_ledger")
+    # physical/logical kept for call-site compatibility; grain is not taken from them.
+    _ = (physical, logical)
+    notes = [
+        n for n in (plan.assumptions or []) if n not in {"d010_gis", "d198_ledger"}
+    ]
+    grain = resolve_dataset_grain(refined, question or "")
+    notes.append(grain_to_assumption(grain))
     plan.assumptions = notes
 
 
@@ -378,27 +455,55 @@ def _enrich_place_scope(plan: SemanticQueryPlan, question: str | None) -> None:
     """PlaceScopePolicy v1.0 — BND/A4/A3 from gazetteer, not suffix heuristics."""
     if not question or not plan.scope or not plan.scope.place:
         return
+    from txt2sql.gazetteer import question_needs_admin_boundary
     from txt2sql.semantic_catalog.place_scope import (
         PlaceEntity,
         PlaceScopeContext,
         resolve_place_scope,
     )
 
-    name = plan.scope.place.name.strip()
+    place = plan.scope.place
+    name = place.name.strip()
     if not name:
         return
+    place_type = place.kind if place.kind != "unknown" else None
+    prefer_admin = question_needs_admin_boundary(question) or any(
+        k in question for k in ("행정동", "경계", "내부", "이내")
+    )
+    prefer_legal = (not prefer_admin) and any(
+        k in question for k in ("법정동", "건물", "건축물", "평균", "높이", "연면적")
+    )
     binding = resolve_place_scope(
-        PlaceEntity(name=name, place_type=plan.scope.place.kind),
-        context=PlaceScopeContext(question=question),
+        PlaceEntity(
+            name=name,
+            place_type=place_type,
+            sido=place.sido,
+            sigungu=place.sigungu,
+        ),
+        context=PlaceScopeContext(
+            question=question,
+            default_sido=place.sido or "부산광역시",
+            prefer_admin=prefer_admin,
+            prefer_legal=prefer_legal,
+        ),
     )
     if binding.semantic_type == "ADMIN_DONG":
-        plan.scope.place.kind = "admin_dong"
+        place.kind = "admin_dong"
         plan.scope.spatial_mode = "boundary"
     elif binding.semantic_type == "LEGAL_DONG":
-        plan.scope.place.kind = "legal_dong"
-        plan.scope.spatial_mode = None
+        place.kind = "legal_dong"
+        plan.scope.spatial_mode = "auto"
     elif binding.semantic_type == "SIGUNGU":
-        plan.scope.place.kind = "gu"
+        place.kind = "gu"
+    elif binding.semantic_type == "SIDO":
+        place.kind = "sido"
+    # Preserve parent admin context for compiler homonym disambiguation.
+    if binding.sido:
+        place.sido = binding.sido
+    if binding.sigungu:
+        place.sigungu = binding.sigungu
+    if binding.code:
+        place.code = binding.code
 
 
 def build_sqp(
@@ -469,13 +574,14 @@ def compile_sql_from_bundle(
     if question:
         tail = _parse_percentile_tail(question)
         if tail is not None and bundle.query_ir.task == "aggregate":
-            pct, rank_field, agg_field = tail
+            pct, rank_field, agg_field, side = tail
             sql = _compile_percentile_tail_sql(
                 question,
                 pct=pct,
                 rank_field=rank_field,
                 agg_field=agg_field,
                 plan=plan,
+                side=side,
             )
             table = get_entity("building").default_table
             if "d198_ledger" in (plan.assumptions or []):
@@ -549,8 +655,29 @@ def should_try_semantic_v2(bundle: ExecutionPlanBundle) -> bool:
         return False
     source = bundle.query_ir.provenance.source_text or ""
     from txt2sql.count_routes import PRIORITY_COUNT_INTENTS, match_priority_count_route
+    from txt2sql.domain import extract_detail_usages, extract_usage_classes
     from txt2sql.intent_router import try_route
 
+    # 명시 구간 분할(미만/~ /초과로 나눠)은 SQP BinSpec 경로 우선
+    if any(k in source for k in ("나눠", "나누어", "나눠서", "구간별", "크기별")):
+        return False
+    # 세부용도·용도분류·구별 파생차이는 SQP grain/derived 경로 우선
+    if extract_detail_usages(source) or extract_usage_classes(source):
+        return False
+    if any(k in source for k in ("용도분류별", "건물용도분류별", "주요용도별")):
+        return False
+    if any(k in source for k in ("각 구", "구·군")) and any(
+        k in source for k in ("차이", "최대", "평균", "두 번째", "두번째")
+    ):
+        return False
+    if "준공연도별" in source and any(k in source for k in ("건폐율", "용적률", "용적율")):
+        return False
+    if any(k in source for k in ("허가된", "허가일", "허가 후")) and any(
+        k in source for k in ("이후", "이후", "부터", "년")
+    ):
+        # 허가 시점 목록은 D198 permit_date SQP 우선
+        if any(k in source for k in ("보여", "찾아", "목록")):
+            return False
     if match_priority_count_route(source) is not None:
         return False
     legacy = try_route(source)
@@ -581,8 +708,37 @@ def should_try_semantic_v2(bundle: ExecutionPlanBundle) -> bool:
     if ir.task == "aggregate":
         # Bare "면적 평균" is often clarify/meta — do not force AVG(gross_floor_area).
         if "면적" in source and not any(
-            tok in source for tok in ("연면적", "건축면적", "대지면적", "부지면적")
+            tok in source
+            for tok in ("연면적", "건축물면적", "건축면적", "대지면적", "부지면적")
         ):
+            return False
+        # Multi-percentile / variance: SQP aliases + VAR_POP are more stable than v2.
+        if any(
+            k in source
+            for k in ("분위수", "분위", "분산", "표준편차", "중앙값", "상관", "상관계수")
+        ):
+            return False
+        if "일수" in source and any(k in source for k in ("중앙값", "표준편차")):
+            return False
+        if len(re.findall(r"\d+(?:\.\d+)?\s*%", source)) >= 2 and "비율" not in source:
+            return False
+        # 주거용·상업용 평균 비교는 SQP FILTER AVG 경로
+        from txt2sql.domain import extract_usage_classes
+
+        usage_classes = extract_usage_classes(source)
+        if len(usage_classes) >= 2 and (
+            any(k in source for k in ("비교", "차이"))
+            or re.search(
+                r"(주거용|상업용|공업용|문교사회용).{0,6}(과|와).{0,6}"
+                r"(주거용|상업용|공업용|문교사회용)",
+                source,
+            )
+        ):
+            return False
+        # 산업단지 면적 집계·기초구역∩행정동은 SQP
+        if "산업단지" in source and "면적" in source and "건물" not in source:
+            return False
+        if "기초구역" in source and any(k in source for k in ("겹치", "교차")):
             return False
         return bool(ir.aggregations)
     if ir.task in {"group", "distribution"}:

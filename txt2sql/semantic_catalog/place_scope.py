@@ -164,10 +164,17 @@ def resolve_place_scope(
         code = sigungu_a3_prefix(name, sido=sido)
         if not sigungu and name.endswith(("구", "군")):
             sigungu = name
-    elif semantic == "ADMIN_DONG":
-        code = None
-    elif semantic == "LEGAL_DONG":
-        code = None
+    elif semantic in {"ADMIN_DONG", "LEGAL_DONG"}:
+        # Homonym dongs: prefer explicit parent sigungu/sido from the entity.
+        if not sigungu and semantic == "LEGAL_DONG":
+            from txt2sql.gazetteer import sigungu_for_legal_dong
+
+            sigungu = sigungu_for_legal_dong(
+                name, sido=sido, question=ctx.question
+            )
+        if sigungu:
+            # Parent A3 prefix for compiler disambiguation (dong name alone is insufficient).
+            code = sigungu_a3_prefix(sigungu, sido=sido)
 
     return PlaceScopeBinding(
         semantic_type=semantic,

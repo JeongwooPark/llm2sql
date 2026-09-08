@@ -7,7 +7,9 @@ from typing import Any, Iterator
 import psycopg
 from psycopg.rows import dict_row
 
-# 읽기 전용: 데이터 변경/DDL 키워드 차단
+from txt2sql.security.sql_ast import assert_readonly_sql_ast
+
+# 읽기 전용: 데이터 변경/DDL 키워드 차단 (AST 보조)
 _FORBIDDEN = (
     "insert",
     "update",
@@ -28,20 +30,22 @@ _GEOM_TYPE_NAMES = {"geometry", "geography"}
 
 
 @contextmanager
-def connect(database_url: str) -> Iterator[psycopg.Connection]:
+def connect(
+    database_url: str,
+    *,
+    read_only: bool = False,
+) -> Iterator[psycopg.Connection]:
     with psycopg.connect(database_url, row_factory=dict_row) as conn:
+        if read_only:
+            with conn.cursor() as cur:
+                cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+            conn.commit()
         yield conn
 
 
 def assert_readonly_sql(sql: str) -> None:
-    normalized = " ".join(sql.lower().split())
-    if not (normalized.startswith("select") or normalized.startswith("with")):
-        raise ValueError("SELECT/WITH 쿼리만 허용됩니다.")
-    if ";" in normalized.rstrip(";"):
-        raise ValueError("한 번에 하나의 SQL문만 허용됩니다.")
-    for word in _FORBIDDEN:
-        if f" {word} " in f" {normalized} " or normalized.startswith(f"{word} "):
-            raise ValueError(f"금지된 키워드가 포함되어 있습니다: {word.upper()}")
+    """AST allowlist first; keyword scan remains as defense in depth inside AST helper."""
+    assert_readonly_sql_ast(sql)
 
 
 def ensure_limit(sql: str, default_limit: int = 100) -> str:
@@ -95,6 +99,11 @@ def execute_query(
                 cur.execute(
                     f"SET LOCAL statement_timeout = {int(statement_timeout_ms)}"
                 )
+            # Prefer transaction-level read-only when connection supports it.
+            try:
+                cur.execute("SET LOCAL transaction_read_only = on")
+            except Exception:
+                pass
             cur.execute(sql)
             if cur.description is None:
                 return []

@@ -14,6 +14,7 @@ from txt2sql.semantic_meta import (
     distinctive_label_tokens,
     format_synonyms,
     table_synonyms,
+    tables_matching_exact_display_names,
     tables_matching_labels,
 )
 
@@ -261,12 +262,9 @@ def discover_searchable_tables(conn: psycopg.Connection) -> list[str]:
     return [fq.split(".")[-1] for fq in searchable_fqnames(conn)]
 
 
-def apply_label_boost(
+def _load_searchable_table_meta(
     conn: psycopg.Connection,
-    question: str,
-    tables: list[str],
-) -> list[str]:
-    """메타데이터 고유 토큰이 질문에 있으면 해당 테이블을 RAG 후보 앞에 둔다."""
+) -> list[dict[str, str]]:
     searchable = {fq.split(".")[-1] for fq in searchable_fqnames(conn)}
     try:
         rows = conn.execute(
@@ -281,8 +279,8 @@ def apply_label_boost(
             conn.rollback()
         except Exception:
             pass
-        return tables
-    meta = [
+        return []
+    return [
         {
             "table_name": str(row["table_name"]),
             "display_name": str(row.get("display_name") or ""),
@@ -292,11 +290,91 @@ def apply_label_boost(
         for row in rows
         if str(row["table_name"]) in searchable
     ]
+
+
+def apply_label_boost(
+    conn: psycopg.Connection,
+    question: str,
+    tables: list[str],
+) -> list[str]:
+    """메타데이터 고유 토큰이 질문에 있으면 해당 테이블을 RAG 후보 앞에 둔다."""
+    meta = _load_searchable_table_meta(conn)
+    if not meta:
+        return tables
     matched = tables_matching_labels(question, meta)
     if not matched:
         return tables
     rest = [name for name in tables if name not in matched]
     return matched + rest
+
+
+def apply_exact_display_pin(
+    conn: psycopg.Connection,
+    question: str,
+    tables: list[str],
+) -> tuple[list[str], list[str]]:
+    """표시명/물리명이 질문에 그대로 있으면 해당 테이블을 주 후보로 고정한다.
+
+    Returns:
+        (재정렬된 tables, exact_matched table names)
+    """
+    meta = _load_searchable_table_meta(conn)
+    if not meta:
+        return tables, []
+    exact = tables_matching_exact_display_names(question, meta)
+    if not exact:
+        return tables, []
+    rest = [name for name in tables if name not in exact]
+    return exact + rest, exact
+
+
+def pin_named_dataset_schema(
+    question: str,
+    tables: list[str],
+    exact: list[str],
+) -> tuple[list[str], str]:
+    """표시명 정확 매칭 시 스키마를 해당 테이블(+필요 시 행정경계)로 좁힌다."""
+    if not exact:
+        return tables, ""
+    pinned = list(exact)
+    placeish = any(
+        k in question
+        for k in (
+            "구",
+            "동",
+            "군",
+            "시",
+            "행정",
+            "법정",
+            "부산",
+            "금정",
+            "해운대",
+            "동래",
+            "연제",
+            "수영",
+            "사하",
+            "사상",
+            "기장",
+            "중구",
+            "서구",
+            "동구",
+            "남구",
+            "북구",
+            "영도",
+            "진구",
+            "강서",
+        )
+    )
+    if placeish and "BND_ADM_DONG_PG" not in pinned:
+        pinned.append("BND_ADM_DONG_PG")
+    names = ", ".join(f'"{t}"' for t in exact)
+    tip = (
+        f"\n- The question explicitly names dataset(s) {names}. "
+        "MUST use that table as the main FROM. "
+        "Do NOT query pnu_def or unrelated building tables "
+        "(AL_D010/AL_D198) unless the named dataset itself is one of them.\n"
+    )
+    return pinned, tip
 
 
 def search_catalog_tables(
@@ -332,11 +410,21 @@ def search_catalog_tables(
     return tables
 
 
-def apply_admin_boost(question: str, tables: list[str]) -> list[str]:
+def apply_admin_boost(
+    question: str,
+    tables: list[str],
+    *,
+    named_dataset_pin: bool = False,
+) -> list[str]:
     if not any(kw in question for kw in _ADMIN_KEYWORDS):
         return tables
     out = list(tables)
-    for t in _ADMIN_HINT_TABLES:
+    # 표시명으로 업로드 테이블이 고정되면 pnu_def/기초구역을 끼워 넣어
+    # LLM이 잘못된 FROM을 고르지 않게 한다.
+    hint_tables = (
+        ("BND_ADM_DONG_PG",) if named_dataset_pin else _ADMIN_HINT_TABLES
+    )
+    for t in hint_tables:
         if t not in out:
             out.append(t)
     return out
@@ -600,7 +688,14 @@ def retrieve_schema(
         top_k=top_k,
     )
     tables = apply_label_boost(conn, question, tables)
-    tables = apply_admin_boost(question, tables)
+    tables, exact_named = apply_exact_display_pin(conn, question, tables)
+    tables = apply_admin_boost(
+        question, tables, named_dataset_pin=bool(exact_named)
+    )
+    extra_tips = ""
+    if exact_named:
+        tables, pin_tip = pin_named_dataset_schema(question, tables, exact_named)
+        extra_tips += pin_tip
 
     # 건물 속성 질의: 기본은 AL_D010. D198은 등록된 구·건축년수·주요용도명.
     from txt2sql.domain import D198_BY_GU, D198_TABLES, d198_gu_mentioned, d198_gus_mentioned
@@ -622,7 +717,11 @@ def retrieve_schema(
             )
         )
     )
-    if any(h in question for h in building_hints):
+    # 표시명으로 다른 데이터셋이 고정된 질문은 건물/D198 스키마를 끼워 넣지 않음
+    allow_building_boost = not exact_named or any(
+        t.startswith("AL_D010") or t.startswith("AL_D198") for t in exact_named
+    )
+    if allow_building_boost and any(h in question for h in building_hints):
         if "AL_D010_26_20250704" not in tables:
             tables.append("AL_D010_26_20250704")
         if needs_d198:
@@ -647,9 +746,8 @@ def retrieve_schema(
                 tables.insert(0, "AL_D060_00_20250804")
 
     # 구별 전용 테이블 우선 + 스키마 힌트
-    extra_tips = ""
     mentioned = d198_gus_mentioned(question)
-    if mentioned:
+    if mentioned and allow_building_boost:
         keep = {D198_BY_GU[gu] for gu in mentioned if D198_BY_GU.get(gu)}
         for gu in reversed(mentioned):
             table = D198_BY_GU.get(gu)

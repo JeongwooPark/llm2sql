@@ -437,8 +437,18 @@ def _route_non_violation_building_count(q: str) -> CountRoute | None:
         return None
     if "위반" not in q or not any(k in q for k in ("아닌", "아니", "제외", "없는", "아닌")):
         return None
+    from txt2sql.domain import extract_structure, extract_usage, structure_a11_predicate
+
     table = _d010_table()
     where = ['"A20" IS DISTINCT FROM \'Y\'']
+    # 구조/용도 술어를 삼키지 않도록 AND로 유지
+    st = extract_structure(q)
+    if st is not None:
+        alias, pattern = st
+        where.append(structure_a11_predicate(q, alias, pattern))
+    usage = extract_usage(q)
+    if usage:
+        where.append(f"\"A9\" = '{usage}'")
     gu = extract_gu(q)
     if gu:
         code = busan_gu_code(gu)

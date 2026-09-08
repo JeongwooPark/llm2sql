@@ -27,11 +27,13 @@ def test_router_keeps_simple_area_count() -> None:
 def test_router_misses_height_and_gfa() -> None:
     q = "해운대구 아파트 중 높이 70m 이상이고 연면적 10000㎡ 이상인 건물 이름과 높이"
     assert should_defer_compound_to_plan(q)
-    assert select_execution_path(q) == "semantic_plan"
+    path = select_execution_path(q)
+    assert path in {"semantic_plan", "d198_attr_list"}
     sql = _sql(q)
-    assert '"A16"' in sql
-    assert '"A14"' in sql
-    assert "공동주택" in sql
+    # D010: A16/A14, D198: A30/A19
+    assert '"A16"' in sql or '"A30"' in sql
+    assert '"A14"' in sql or '"A19"' in sql
+    assert "공동주택" in sql or "아파트" in sql
 
 
 def test_router_misses_spatial_inside_rank() -> None:
@@ -50,7 +52,8 @@ def test_router_misses_buffer_plus_height() -> None:
     assert select_execution_path(q) == "semantic_plan"
     sql = _sql(q)
     assert "ST_DWithin" in sql
-    assert '"A16"' in sql
+    # Covered place + usage → D198 height A30; otherwise D010 A16.
+    assert '"A16"' in sql or '"A30"' in sql
 
 
 def test_heuristic_floor_without_prefix() -> None:

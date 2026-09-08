@@ -49,6 +49,17 @@ def _entity_from_contract(contract: Any) -> EntityName:
     return "building"
 
 
+def _rel_to_op(rel: str | None, *, bound: str) -> str:
+    token = (rel or "").strip()
+    if bound == "low":
+        if token in {"초과"}:
+            return "gt"
+        return "gte"
+    if token in {"미만"}:
+        return "lt"
+    return "lte"
+
+
 def _coalesce_or_predicates(contract: Any, predicates: list[PredicateIR]) -> list[PredicateIR]:
     """동일 필드 eq predicate가 OR로 연결된 경우 logical_group으로 묶는다."""
     has_or = any(
@@ -64,6 +75,8 @@ def _coalesce_or_predicates(contract: Any, predicates: list[PredicateIR]) -> lis
             pred.field
             and pred.operator == "eq"
             and pred.field in {"usage", "detail_usage", "structure"}
+            and not pred.negated
+            and not pred.children
         ):
             grouped.setdefault(pred.field, []).append(pred)
         else:
@@ -77,6 +90,44 @@ def _coalesce_or_predicates(contract: Any, predicates: list[PredicateIR]) -> lis
     return merged
 
 
+def _apply_not_from_contract(contract: Any, predicates: list[PredicateIR]) -> list[PredicateIR]:
+    """Mark OR groups / categorical leaves negated when contract NOT scopes them."""
+    not_spans = [
+        span
+        for span in getattr(contract, "boolean_ops", []) or []
+        if getattr(span, "kind", None) == "not"
+    ]
+    if not not_spans:
+        return predicates
+    scopes_or = any((getattr(span, "meta", None) or {}).get("scopes_or") for span in not_spans)
+    operands: set[str] = set()
+    for span in not_spans:
+        meta = getattr(span, "meta", None) or {}
+        for item in meta.get("operands") or []:
+            operands.add(str(item))
+    if not scopes_or and not operands:
+        return predicates
+
+    out: list[PredicateIR] = []
+    for pred in predicates:
+        if pred.logical_group == "or" and scopes_or:
+            out.append(pred.model_copy(update={"negated": True}))
+            continue
+        if (
+            pred.operator == "eq"
+            and pred.field in {"usage", "detail_usage", "structure"}
+            and pred.value is not None
+            and (
+                str(pred.value) in operands
+                or any(op in str(pred.value) or str(pred.value) in op for op in operands)
+            )
+        ):
+            out.append(pred.model_copy(update={"negated": True}))
+            continue
+        out.append(pred)
+    return out
+
+
 def _coalesce_union_predicates(contract: Any, predicates: list[PredicateIR]) -> list[PredicateIR]:
     """「공장과 창고를 합친」처럼 union count 의도면 OR/IN으로 묶는다."""
     q = getattr(contract, "question", "") or ""
@@ -85,7 +136,12 @@ def _coalesce_union_predicates(contract: Any, predicates: list[PredicateIR]) -> 
     grouped: dict[str, list[PredicateIR]] = {}
     rest: list[PredicateIR] = []
     for pred in predicates:
-        if pred.field and pred.operator == "eq" and pred.field in {"usage", "detail_usage"}:
+        if (
+            pred.field
+            and pred.operator == "eq"
+            and pred.field in {"usage", "detail_usage"}
+            and not pred.negated
+        ):
             grouped.setdefault(pred.field, []).append(pred)
         else:
             rest.append(pred)
@@ -112,29 +168,75 @@ def contract_to_query_ir(contract: Any) -> QueryIR:
     predicates: list[PredicateIR] = []
     for span in getattr(contract, "ranges", None) or []:
         meta = getattr(span, "meta", None) or {}
-        predicates.append(
-            PredicateIR(
-                field=meta.get("field") or getattr(span, "value", None),
-                operator=meta.get("operator") or "between",
-                value=meta.get("low", getattr(span, "value", None)),
-                value2=meta.get("high"),
-                unit=meta.get("unit"),
-                provenance=_span_prov(span),
+        lo_rel = meta.get("lo_rel")
+        hi_rel = meta.get("hi_rel")
+        field = meta.get("field") or getattr(span, "value", None)
+        low = meta.get("low", getattr(span, "value", None))
+        high = meta.get("high")
+        unit = meta.get("unit")
+        exclusive = (lo_rel == "초과") or (hi_rel == "미만")
+        if exclusive and low is not None and high is not None:
+            predicates.append(
+                PredicateIR(
+                    field=field,
+                    operator=_rel_to_op(lo_rel, bound="low"),
+                    value=low,
+                    unit=unit,
+                    provenance=_span_prov(span),
+                )
             )
-        )
+            predicates.append(
+                PredicateIR(
+                    field=field,
+                    operator=_rel_to_op(hi_rel, bound="high"),
+                    value=high,
+                    unit=unit,
+                    provenance=_span_prov(span),
+                )
+            )
+        else:
+            predicates.append(
+                PredicateIR(
+                    field=field,
+                    operator=meta.get("operator") or "between",
+                    value=low,
+                    value2=high,
+                    unit=unit,
+                    provenance=_span_prov(span),
+                )
+            )
     for span in getattr(contract, "comparisons", None) or []:
         meta = getattr(span, "meta", None) or {}
+        value = getattr(span, "value", None)
+        left = meta.get("field") or meta.get("left")
+        operator = meta.get("operator") or meta.get("op") or "eq"
+        right_field = meta.get("right_field") or meta.get("value_field")
+        cmp_value = meta.get("value")
+        if isinstance(value, dict):
+            left = value.get("left") or left
+            operator = value.get("op") or operator
+            right_field = value.get("right") or right_field
+        # Map Korean metric labels to fields when still present.
+        from txt2sql.query_understanding import operators as ops
+
+        if isinstance(left, str) and left in ops.METRIC_MAP:
+            left = ops.METRIC_MAP[left]
+        if isinstance(right_field, str) and right_field in ops.METRIC_MAP:
+            right_field = ops.METRIC_MAP[right_field]
         predicates.append(
             PredicateIR(
-                field=meta.get("field") or meta.get("left"),
-                operator=meta.get("operator") or "eq",
-                value=meta.get("value"),
-                value_field=meta.get("right_field") or meta.get("value_field"),
+                field=left,
+                operator=operator,
+                value=cmp_value,
+                value_field=right_field,
                 provenance=_span_prov(span),
             )
         )
     for span in getattr(contract, "numbers", None) or []:
         meta = getattr(span, "meta", None) or {}
+        role = meta.get("role", "threshold")
+        if role != "threshold":
+            continue
         if meta.get("field") or meta.get("operator"):
             predicates.append(
                 PredicateIR(
@@ -171,6 +273,7 @@ def contract_to_query_ir(contract: Any) -> QueryIR:
 
     predicates = _coalesce_or_predicates(contract, predicates)
     predicates = _coalesce_union_predicates(contract, predicates)
+    predicates = _apply_not_from_contract(contract, predicates)
 
     aggregations: list[AggregationIR] = []
     for req in getattr(contract, "aggregation_requests", None) or []:
@@ -216,11 +319,29 @@ def contract_to_query_ir(contract: Any) -> QueryIR:
         UnresolvedIR(code="UNRESOLVED_SPAN", message=getattr(s, "text", ""), span=_span_prov(s))
         for s in (getattr(contract, "unresolved_spans", None) or [])
     ]
+    # Multi-place: keep first in scope; surface extras so they are not silently dropped.
+    if len(places) > 1:
+        for extra in places[1:]:
+            unresolved.append(
+                UnresolvedIR(
+                    code="EXTRA_PLACE",
+                    message=str(getattr(extra, "value", None) or getattr(extra, "text", "") or ""),
+                    span=_span_prov(extra),
+                )
+            )
 
     temporal = TemporalIR() if getattr(contract, "wants_temporal", False) else None
     spatial: list[SpatialIR] = []
     if getattr(contract, "wants_spatial", False):
-        spatial.append(SpatialIR(relation="within"))
+        distance = next(
+            (
+                float(getattr(n, "value"))
+                for n in getattr(contract, "numbers", []) or []
+                if (getattr(n, "meta", None) or {}).get("role") == "distance"
+            ),
+            None,
+        )
+        spatial.append(SpatialIR(relation="within", distance_m=distance))
 
     # Strip physical dataset names from contract.datasets — keep only as unresolved/provenance note
     legacy_datasets = list(getattr(contract, "datasets", None) or [])
@@ -234,6 +355,11 @@ def contract_to_query_ir(contract: Any) -> QueryIR:
     # Do not copy physical table names into IR; record count only
     if legacy_datasets:
         safe_hints["legacy_dataset_hint_count"] = len(legacy_datasets)
+    if len(places) > 1:
+        safe_hints["extra_places"] = [
+            str(getattr(p, "value", None) or getattr(p, "text", "") or "")
+            for p in places[1:]
+        ]
 
     task = normalize_task(getattr(contract, "query_kind", None) or getattr(contract, "operation", None))
     if not aggregations and dimensions and (

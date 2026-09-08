@@ -79,7 +79,7 @@ def test_percentile_tail_sql() -> None:
     )
 
     parsed = _parse_percentile_tail("부산에서 높이 상위 1% 건물의 평균 연면적을 구해줘")
-    assert parsed == (0.99, "height_m", "gross_floor_area_m2")
+    assert parsed == (0.99, "height_m", "gross_floor_area_m2", "high")
     ir = QueryIR(
         task="aggregate",
         entity="building",

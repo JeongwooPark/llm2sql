@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 from txt2sql.dataset_grain import query_ir_needs_d198, resolve_dataset_grain
-from txt2sql.query_ir.models import PredicateIR, QueryIR, ScopeIR
+from txt2sql.domain import reset_d198_coverage
 from txt2sql.query_contract import verify_task_output_alignment
+from txt2sql.query_ir.models import PredicateIR, QueryIR, ScopeIR
 from txt2sql.semantic_plan.models import SemanticQueryPlan
+
+
+def setup_function() -> None:
+    reset_d198_coverage()
+
+
+def teardown_function() -> None:
+    reset_d198_coverage()
 
 
 def test_simple_usage_count_prefers_d010_grain() -> None:
@@ -19,7 +28,7 @@ def test_simple_usage_count_prefers_d010_grain() -> None:
     assert not query_ir_needs_d198(ir, "남구 창고시설 몇 채야?")
 
 
-def test_height_predicate_needs_d198() -> None:
+def test_height_predicate_prefers_d010() -> None:
     ir = QueryIR(
         task="count",
         entity="building",
@@ -29,7 +38,7 @@ def test_height_predicate_needs_d198() -> None:
             PredicateIR(field="height_m", operator="gte", value=40),
         ],
     )
-    assert resolve_dataset_grain(ir, "부산진구 업무시설 높이 40m 이상 몇 채") == "d198"
+    assert resolve_dataset_grain(ir, "부산진구 업무시설 높이 40m 이상 몇 채") == "d010"
 
 
 def test_count_task_requires_count_sql() -> None:

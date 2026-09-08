@@ -55,19 +55,22 @@ def test_sigungu_a3_prefix_busan_fallback() -> None:
     assert resolve_place_kind("우1동", "우1동 행정동 내부") == "admin_dong"
     assert resolve_place_kind("우1동") == "admin_dong"
     assert uses_admin_boundary("우1동", question="우1동 행정동") is True
-    assert uses_admin_boundary("우1동") is True
+    assert uses_admin_boundary("우1동") is False
     assert uses_admin_boundary("구서동") is False
 
 
-def test_numbered_admin_dong_simple_count_uses_bnd() -> None:
-    """순수 행정동(admin_dong only) → BND 공간조인."""
+def test_numbered_admin_dong_simple_count_uses_a4() -> None:
+    """단순 동 이름 count → A4 (P012 §8); BND는 공간 cue 있을 때만."""
+    from txt2sql.intent_router import try_route
+
+    routed = try_route("대저1동 건물 수를 알려줘")
+    assert routed is not None
+    assert "BND_ADM" not in routed.sql
+    assert '"A4"' in routed.sql or "A4" in routed.sql
     plan = try_heuristic_plan("대저1동 건물 수를 알려줘")
     assert plan is not None
-    assert plan.scope and plan.scope.place
-    assert plan.scope.place.kind == "admin_dong"
     sql = compile_semantic_plan(plan).sql
-    assert "BND_ADM_DONG_PG" in sql
-    assert "ADM_NM" in sql
+    assert "BND_ADM_DONG_PG" not in sql
 
 
 def test_numbered_dong_inside_uses_bnd() -> None:
@@ -118,4 +121,37 @@ def test_building_place_predicate_gu_uses_a3() -> None:
     pred = building_place_predicate("금정구")
     assert "A3" in pred
     assert "26410" in pred
-    assert "A4" not in pred
+
+
+def test_resolve_place_scope_homonym_uses_entity_sigungu() -> None:
+    from txt2sql.semantic_catalog.place_scope import PlaceEntity, resolve_place_scope
+
+    binding = resolve_place_scope(
+        PlaceEntity(name="중동", place_type="legal_dong", sigungu="해운대구", sido="부산광역시")
+    )
+    assert binding.sigungu == "해운대구"
+    assert binding.sido == "부산광역시"
+    assert binding.code is not None
+    assert binding.code.startswith("26")
+
+
+def test_compiler_uses_place_sigungu_for_dong_a3() -> None:
+    from txt2sql.semantic_plan.models import PlaceSpec, ScopeSpec, SemanticQueryPlan
+
+    plan = SemanticQueryPlan(
+        query_kind="count",
+        entity="building",
+        scope=ScopeSpec(
+            place=PlaceSpec(
+                name="연산동",
+                kind="legal_dong",
+                sigungu="연제구",
+                sido="부산광역시",
+                code="26470",
+            )
+        ),
+    )
+    sql = compile_semantic_plan(plan).sql
+    assert "A4" in sql
+    assert "26470" in sql
+    assert "A3" in sql

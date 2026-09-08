@@ -40,8 +40,18 @@ def _clip(text: str, n: int = 240) -> str:
 
 
 def parse_nums(text: str) -> list[float]:
+    text = text or ""
+    # Metric-style kv only (p25=, resi_h=). Group ``gu=/n=`` keeps full NUM_RE.
+    metric_kv = re.findall(
+        r"(?:p\d+|pctl\w*|percentile\w*|var_\w*|resi_\w*|com_\w*|ind_\w*|"
+        r"avg_\w*|sum_\w*|min_\w*|max_\w*|median_\w*|std\w*|diff|ratio\w*|pct\w*)"
+        r"\s*=\s*(-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+\.\d+|-?\d+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    raw = metric_kv if metric_kv else NUM_RE.findall(text)
     out: list[float] = []
-    for m in NUM_RE.findall(text or ""):
+    for m in raw:
         try:
             out.append(float(m.replace(",", "")))
         except ValueError:
@@ -483,7 +493,7 @@ def write_failure_report(payload: dict[str, Any]) -> None:
 
 
 def _load_wanted_ids(argv: list[str]) -> tuple[set[str] | None, list[str]]:
-    global OUT, FAIL_REPORT, FAIL_MD, FULL_COPY, PATTERN_IDS
+    global OUT, FAIL_REPORT, FAIL_MD, FULL_COPY, PATTERN_IDS, GOLD, TIMEOUT_S
     wanted: set[str] | None = None
     rest: list[str] = []
     i = 1
@@ -518,6 +528,14 @@ def _load_wanted_ids(argv: list[str]) -> tuple[set[str] | None, list[str]]:
             if key not in blob:
                 raise SystemExit(f"unknown pattern {key}; have {sorted(blob)}")
             wanted = {str(x) for x in blob[key]}
+            i += 2
+            continue
+        if arg == "--gold" and i + 1 < len(argv):
+            GOLD = Path(argv[i + 1])
+            i += 2
+            continue
+        if arg == "--timeout" and i + 1 < len(argv):
+            TIMEOUT_S = int(argv[i + 1])
             i += 2
             continue
         if arg == "--out" and i + 1 < len(argv):

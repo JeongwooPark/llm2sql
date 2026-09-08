@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import re
+
 from txt2sql.building_row import (
     infer_building_schema_from_columns,
     infer_row_dataset,
@@ -52,8 +56,9 @@ def test_followup_address_and_lot(monkeypatch) -> None:
     assert is_followup_question("주소는?", session)
     addr = answer_followup(_Conn(), "주소는?", session)
     assert "구서동 183-2" in addr.answer
-    assert "주소는 1" not in addr.answer
+    assert not addr.answer.strip().startswith("주소는 1")
 
     lot = answer_followup(_Conn(), "지번은?", session)
     assert "183-2" in lot.answer
-    assert "지번은 1" not in lot.answer
+    # Avoid false positive: "지번은 183-2" contains substring "지번은 1".
+    assert not re.search(r"지번은\s+1(?:\D|$)", lot.answer)

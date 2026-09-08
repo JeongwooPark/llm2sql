@@ -32,6 +32,30 @@ def test_table_synonyms_from_metadata() -> None:
     assert "토지" in syns
 
 
+def test_exact_display_pins_urban_table() -> None:
+    from txt2sql.semantic_meta import tables_matching_exact_display_names
+
+    q = "활동인구 1인당 시가화용지 활용/미활용 면적_행정동의 데이터 중 금정구의 것만 출력하라."
+    matched = tables_matching_exact_display_names(
+        q,
+        [
+            {
+                "table_name": "adm_urban_area_per_capita",
+                "display_name": URBAN_DISPLAY,
+                "description": "",
+                "category": "토지",
+            },
+            {
+                "table_name": "pnu_def",
+                "display_name": "PNU정의",
+                "description": "",
+                "category": "코드",
+            },
+        ],
+    )
+    assert matched == ["adm_urban_area_per_capita"]
+
+
 def test_label_boost_picks_urban_table() -> None:
     matched = tables_matching_labels(
         "행정동별 시가화용지 면적은?",

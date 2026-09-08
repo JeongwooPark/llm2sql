@@ -1,0 +1,258 @@
+{
+  "baseline": {
+    "passed": 413,
+    "total": 485,
+    "acc": 85.2
+  },
+  "p012_full": {
+    "passed": 459,
+    "total": 485,
+    "acc": 94.6
+  },
+  "delta_passed": 46,
+  "gained": [
+    "Q044",
+    "Q062",
+    "Q063",
+    "Q128",
+    "Q129",
+    "Q131",
+    "Q140",
+    "Q154",
+    "Q170",
+    "Q171",
+    "Q172",
+    "Q180",
+    "Q188",
+    "Q189",
+    "Q202",
+    "Q204",
+    "Q206",
+    "Q218",
+    "Q222",
+    "Q236",
+    "Q238",
+    "Q240",
+    "Q242",
+    "Q273",
+    "Q278",
+    "Q281",
+    "Q291",
+    "Q293",
+    "Q299",
+    "Q308",
+    "Q320",
+    "Q326",
+    "Q333",
+    "Q339",
+    "Q348",
+    "Q349",
+    "Q357",
+    "Q358",
+    "Q359",
+    "Q402",
+    "Q404",
+    "Q408",
+    "Q414",
+    "Q415",
+    "Q416",
+    "Q478"
+  ],
+  "lost": [],
+  "lost_detail": [],
+  "remain_fail": [
+    "Q190",
+    "Q195",
+    "Q263",
+    "Q264",
+    "Q270",
+    "Q271",
+    "Q288",
+    "Q296",
+    "Q368",
+    "Q378",
+    "Q396",
+    "Q397",
+    "Q399",
+    "Q400",
+    "Q419",
+    "Q420",
+    "Q427",
+    "Q431",
+    "Q437",
+    "Q439",
+    "Q442",
+    "Q447",
+    "Q448",
+    "Q450",
+    "Q461",
+    "Q464"
+  ],
+  "fail_reasons": [
+    [
+      "group-mismatch",
+      10
+    ],
+    [
+      "compare-num-missing",
+      5
+    ],
+    [
+      "meta-mismatch",
+      2
+    ],
+    [
+      "count-mismatch gold=19434 pred=[19416.0, 19416.0] (policy-mismatch-integer_exact hits=0 gold=[19434.0])",
+      1
+    ],
+    [
+      "count-mismatch gold=13692 pred=[15406.0, 15406.0] (policy-mismatch-integer_exact hits=0 gold=[13692.0])",
+      1
+    ],
+    [
+      "count-mismatch gold=12400 pred=[10487.0, 10487.0] (policy-mismatch-integer_exact hits=0 gold=[12400.0])",
+      1
+    ],
+    [
+      "count-mismatch gold=642 pred=[1.0, 645.0, 645.0] (policy-mismatch-integer_exact hits=0 gold=[642.0])",
+      1
+    ],
+    [
+      "count-mismatch gold=12 pred=[3.0, 0.0, 0.0] (policy-mismatch-integer_exact hits=0 gold=[12.0])",
+      1
+    ],
+    [
+      "scalar-mismatch hits=0 gold=[0.9873] (policy-mismatch-scalar_float hits=0 gold=[0.9873])",
+      1
+    ],
+    [
+      "count-mismatch gold=470 pred=[] (policy-mismatch-integer_exact hits=0 gold=[470.0])",
+      1
+    ],
+    [
+      "engine-fail:ValueError: SQL 구문 오류: Expecting ). Line 3, Col: 37.\n  SELECT \n  COUNT(DISTINCT d010.\"PNU\") AS total_pnu,\n  COUNT(DISTINCT d010.\"PNU\" \u001b[4mINTERSECT\u001b[0m d198.\"PNU\") AS matched_pnu,\n  ROUND((100.0 * COUNT(DISTINCT d010.\"PNU\" INTERSECT d198.\"PNU\") / COUN",
+      1
+    ],
+    [
+      "count-mismatch gold=38613 pred=[10.0, 198.0, 38794.0, 38794.0] (policy-mismatch-integer_exact hits=0 gold=[38613.0])",
+      1
+    ]
+  ],
+  "remain_samples": [
+    [
+      "Q190",
+      "group",
+      "각 구·군에서 가장 높은 건물과 두 번째 높은 건물의 높이 차이를 보여줘",
+      "group-mismatch"
+    ],
+    [
+      "Q195",
+      "compare",
+      "산지와 일반지번의 평균 높이 차이를 알려줘",
+      "compare-num-missing"
+    ],
+    [
+      "Q263",
+      "count",
+      "금정구에서 공동주택을 제외한 건물 수를 알려줘",
+      "count-mismatch gold=19434 pred=[19416.0, 19416.0"
+    ],
+    [
+      "Q264",
+      "count",
+      "동래구에서 제1종과 제2종근린생활시설을 제외한 건물 수는?",
+      "count-mismatch gold=13692 pred=[15406.0, 15406.0"
+    ],
+    [
+      "Q270",
+      "compare",
+      "동래구에서 아파트와 다세대주택 건수를 비교해줘",
+      "compare-num-missing"
+    ],
+    [
+      "Q271",
+      "compare",
+      "금정구에서 주거용 건물 수와 상업용 건물 수를 비교해줘",
+      "compare-num-missing"
+    ],
+    [
+      "Q288",
+      "compare",
+      "동래구 아파트와 다세대주택의 평균 지상층수를 비교해줘",
+      "compare-num-missing"
+    ],
+    [
+      "Q296",
+      "count",
+      "동래구 단독주택 중 위반건축물이 아닌 건물 수를 알려줘",
+      "count-mismatch gold=12400 pred=[10487.0, 10487.0"
+    ],
+    [
+      "Q368",
+      "count",
+      "장림1동 안에서 철근콘크리트구조 건물 수는?",
+      "count-mismatch gold=642 pred=[1.0, 645.0, 645.0]"
+    ],
+    [
+      "Q378",
+      "count",
+      "대연3동과 맞닿은 행정동 수는 몇 개야?",
+      "count-mismatch gold=12 pred=[3.0, 0.0, 0.0] (pol"
+    ],
+    [
+      "Q396",
+      "group",
+      "사하구에서 건물 수가 100개 이상인 기초구역만 보여줘",
+      "group-mismatch"
+    ],
+    [
+      "Q397",
+      "group",
+      "부산진구 기초구역별 위반건축물 수를 보여줘",
+      "group-mismatch"
+    ],
+    [
+      "Q399",
+      "group",
+      "기초구역별 건물 수를 면적으로 나눈 밀도를 계산해 상위 20개를 보여줘",
+      "group-mismatch"
+    ],
+    [
+      "Q400",
+      "group",
+      "기초구역별 총 연면적을 면적으로 나눈 값을 계산해 상위 20개를 보여줘",
+      "group-mismatch"
+    ],
+    [
+      "Q419",
+      "group",
+      "산업단지 내부 건물 수가 많은 상위 10개 단지를 보여줘",
+      "group-mismatch"
+    ]
+  ],
+  "stage_gates": {
+    "P0": "10/10",
+    "P1": "32/40",
+    "P2": "5/5"
+  },
+  "cluster_in_full": {
+    "P0": "9/10",
+    "P1": "31/40",
+    "P2": "5/5",
+    "P0_fail": [
+      "Q419"
+    ],
+    "P1_fail": [
+      "Q190",
+      "Q396",
+      "Q397",
+      "Q399",
+      "Q400",
+      "Q420",
+      "Q431",
+      "Q437",
+      "Q448"
+    ],
+    "P2_fail": []
+  }
+}

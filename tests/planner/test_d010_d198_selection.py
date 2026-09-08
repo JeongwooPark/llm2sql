@@ -1,15 +1,39 @@
 """Fast path / D010 / D198 / spatial selection."""
 
+from txt2sql.domain import reset_d198_coverage, set_d198_coverage
 from txt2sql.planner.logical import build_logical_plan
 from txt2sql.planner.physical import select_physical_plan
 from txt2sql.query_ir.models import AggregationIR, PredicateIR, QueryIR, ScopeIR
 from txt2sql.semantic_catalog.binding import SemanticBinding
 
 
-def test_d010_selection() -> None:
+def setup_function() -> None:
+    reset_d198_coverage()
+
+
+def teardown_function() -> None:
+    reset_d198_coverage()
+
+
+def test_d010_selection_when_uncovered() -> None:
     ir = QueryIR(
         task="count",
-        scope=ScopeIR(place="동래구"),
+        scope=ScopeIR(place="남구"),
+        predicates=[PredicateIR(field="usage", operator="eq", value="창고시설")],
+        aggregations=[AggregationIR(function="count")],
+    )
+    logical = build_logical_plan(ir)
+    logical.status = "READY"
+    logical.reason_codes = []
+    physical = select_physical_plan(logical, question="남구 창고시설 몇 채야?")
+    assert physical.strategy == "D010_EXECUTOR"
+
+
+def test_d198_selection_when_covered_usage() -> None:
+    set_d198_coverage({"동래구": "AL_D198_26260_20250115"})
+    ir = QueryIR(
+        task="count",
+        scope=ScopeIR(place="동래구", place_kind="gu"),
         predicates=[PredicateIR(field="usage", operator="eq", value="창고시설")],
         aggregations=[AggregationIR(function="count")],
     )
@@ -17,7 +41,7 @@ def test_d010_selection() -> None:
     logical.status = "READY"
     logical.reason_codes = []
     physical = select_physical_plan(logical, question="동래구 창고시설 몇 채야?")
-    assert physical.strategy == "D010_EXECUTOR"
+    assert physical.strategy == "D198_EXECUTOR"
 
 
 def test_d198_selection() -> None:

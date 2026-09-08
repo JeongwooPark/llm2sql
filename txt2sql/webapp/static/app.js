@@ -157,14 +157,68 @@
     return msg || "알 수 없는 오류가 발생했습니다.";
   }
 
-  async function ensureSession() {
-    if (sessionId) return sessionId;
+  function clearSession() {
+    sessionId = null;
+    try {
+      localStorage.removeItem(SESSION_KEY);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  async function ensureSession({ forceNew = false } = {}) {
+    if (sessionId && !forceNew) return sessionId;
     const res = await fetch("/api/session", { method: "POST" });
     if (!res.ok) throw new Error("세션을 만들 수 없습니다.");
     const data = await res.json();
     sessionId = data.session_id;
     localStorage.setItem(SESSION_KEY, sessionId);
     return sessionId;
+  }
+
+  async function readHttpError(res) {
+    try {
+      const data = await res.json();
+      const detail = data?.detail;
+      if (typeof detail === "string") {
+        return { message: detail, code: data?.code || null };
+      }
+      if (detail && typeof detail === "object") {
+        return {
+          message:
+            detail.detail ||
+            detail.message ||
+            `요청 실패 (${res.status})`,
+          code: detail.code || data?.code || null,
+        };
+      }
+      return {
+        message: data?.message || `요청 실패 (${res.status})`,
+        code: data?.code || null,
+      };
+    } catch {
+      return { message: `요청 실패 (${res.status})`, code: null };
+    }
+  }
+
+  async function openChatStream(question, { retried = false } = {}) {
+    await ensureSession();
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(chatPayload(question)),
+    });
+    if (res.ok && res.body) return res;
+    const err = await readHttpError(res);
+    if (
+      !retried &&
+      (err.code === "session_not_found" || err.code === "session_invalid")
+    ) {
+      clearSession();
+      await ensureSession({ forceNew: true });
+      return openChatStream(question, { retried: true });
+    }
+    throw new Error(err.message || `요청 실패 (${res.status})`);
   }
 
   async function sendQuestion(question) {
@@ -179,12 +233,7 @@
     const shell = appendBotShell();
 
     try {
-      await ensureSession();
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(chatPayload(q)),
-      });
+      const res = await openChatStream(q);
       if (!res.ok || !res.body) {
         throw new Error(`요청 실패 (${res.status})`);
       }
@@ -793,12 +842,7 @@
     const q = String(question || "").trim();
     if (!q) return;
     try {
-      await ensureSession();
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(chatPayload(q)),
-      });
+      const res = await openChatStream(q);
       if (!res.ok || !res.body) return;
       const reader = res.body.getReader();
       const decoder = new TextDecoder("utf-8");

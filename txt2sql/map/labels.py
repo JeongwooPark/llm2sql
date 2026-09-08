@@ -326,12 +326,19 @@ def label_catalog_layers(
     settings: Settings, layers: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     index = MetaIndex.load(settings)
-    geom_types = _catalog_geom_types(settings)
+    layer_names = [
+        str(item.get("name") or "").strip()
+        for item in layers
+        if str(item.get("name") or "").strip()
+    ]
+    geom_types = _catalog_geom_types(settings, names=layer_names)
     need_fallback = any(
         not (isinstance(item.get("extent"), list) and len(item.get("extent") or []) == 4)
         for item in layers
     )
-    fallback_ext = _catalog_estimated_extents(settings) if need_fallback else {}
+    fallback_ext = (
+        _catalog_estimated_extents(settings, names=layer_names) if need_fallback else {}
+    )
     out: list[dict[str, Any]] = []
     for item in layers:
         row = dict(item)
@@ -355,18 +362,32 @@ def label_catalog_layers(
     return out
 
 
-def _catalog_geom_types(settings: Settings) -> dict[str, str]:
+def _catalog_geom_types(
+    settings: Settings, *, names: list[str] | None = None
+) -> dict[str, str]:
     """PostGIS geometry_columns에서 레이어별 도형 종류를 읽는다."""
+    wanted = {n for n in (names or []) if n and not n.startswith("temp_")}
     out: dict[str, str] = {}
     try:
         with connect(settings.database_url) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT f_table_name, type
-                    FROM geometry_columns
-                    """
-                )
+                if wanted:
+                    cur.execute(
+                        """
+                        SELECT f_table_name, type
+                        FROM geometry_columns
+                        WHERE f_table_name = ANY(%s)
+                        """,
+                        (sorted(wanted),),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT f_table_name, type
+                        FROM geometry_columns
+                        WHERE f_table_name NOT LIKE 'temp\\_%' ESCAPE '\\'
+                        """
+                    )
                 for row in cur.fetchall():
                     name = str(row["f_table_name"] or "")
                     gtype = str(row["type"] or "").strip()
@@ -378,8 +399,17 @@ def _catalog_geom_types(settings: Settings) -> dict[str, str]:
     return out
 
 
-def _catalog_estimated_extents(settings: Settings) -> dict[str, list[float]]:
-    """통계 기반 bbox. GeoServer bbox가 없을 때 줌용 폴백."""
+def _catalog_estimated_extents(
+    settings: Settings, *, names: list[str] | None = None
+) -> dict[str, list[float]]:
+    """통계 기반 bbox. GeoServer bbox가 없을 때 줌용 폴백.
+
+    temp_* 수천 개에 ST_EstimatedExtent를 돌리면 KorDB 목록이 수 분 걸린다.
+    카탈로그에 올라온 레이어명만 대상으로 한다.
+    """
+    wanted = {n for n in (names or []) if n and not n.startswith("temp_")}
+    if not wanted:
+        return {}
     out: dict[str, list[float]] = {}
     try:
         with connect(settings.database_url) as conn:
@@ -388,7 +418,9 @@ def _catalog_estimated_extents(settings: Settings) -> dict[str, list[float]]:
                     """
                     SELECT f_table_schema, f_table_name, f_geometry_column, srid
                     FROM geometry_columns
-                    """
+                    WHERE f_table_name = ANY(%s)
+                    """,
+                    (sorted(wanted),),
                 )
                 meta = list(cur.fetchall())
             for row in meta:

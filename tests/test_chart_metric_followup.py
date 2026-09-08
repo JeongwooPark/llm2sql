@@ -110,3 +110,18 @@ def test_rebuild_far_when_old_spec_omits_it() -> None:
     assert result is not None
     assert result["route"] == "chart_render"
     assert result["chart"]["datasets"][0]["data"] == [173.3, 145.3]
+
+
+def test_accept_chart_display_from_named_dataset_rows() -> None:
+    session = SessionContext()
+    session.last_route = "named_dataset_attr"
+    session.last_rows = [
+        {"ADM_NM": "구서1동", "n10": 1903.45},
+        {"ADM_NM": "남산동", "n10": 3387.61},
+    ]
+    session.last_full_question = "금정구 10세 유동인구"
+    result = _try_chart_turn("차트로 표시하라", session, ProgressTracker(), None)
+    assert result is not None
+    assert result["route"] == "chart_render"
+    assert "확인이 필요" not in (result.get("answer") or "")
+    assert result["chart"]["labels"] == ["구서1동", "남산동"]

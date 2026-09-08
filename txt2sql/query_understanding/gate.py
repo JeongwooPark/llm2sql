@@ -10,6 +10,7 @@ from txt2sql.semantic_plan.predicate_utils import (
     has_field_compare,
     has_op,
     has_operator,
+    predicate_fields,
     range_bounds,
 )
 
@@ -47,6 +48,8 @@ def accept_heuristic_plan(contract: QueryContract, plan: SemanticQueryPlan) -> b
     if contract.ranges:
         if not _range_filters_bound(contract, plan, pred):
             return False
+    if not _threshold_numbers_bound(contract, plan, pred):
+        return False
     if contract.aggregations:
         wanted = {span.value for span in contract.aggregations}
         got = {item.function for item in plan.aggregations}
@@ -54,6 +57,21 @@ def accept_heuristic_plan(contract: QueryContract, plan: SemanticQueryPlan) -> b
             return False
         if contract.groups and not plan.group_by:
             return False
+        # Aggregation target field must match when contract bound a numeric field.
+        for req in contract.aggregation_requests:
+            if req.function == "count" or not req.field:
+                continue
+            matched = any(
+                item.function == req.function and item.field == req.field
+                for item in plan.aggregations
+            )
+            if not matched and req.function in got:
+                # Allow count-only plans without field; otherwise require field match.
+                if any(
+                    item.function == req.function and item.field
+                    for item in plan.aggregations
+                ):
+                    return False
     if contract.order:
         wanted_dir = contract.order[0].value
         if not plan.order_by or plan.order_by[0].direction != wanted_dir:
@@ -75,6 +93,19 @@ def accept_heuristic_plan(contract: QueryContract, plan: SemanticQueryPlan) -> b
             )
             if not is_busan_wide(contract.question) and not industrial_place:
                 return False
+    return True
+
+
+def _threshold_numbers_bound(contract: QueryContract, plan: SemanticQueryPlan, pred) -> bool:
+    semantic_fields = predicate_fields(pred) | {item.field for item in plan.filters}
+    for span in contract.numbers:
+        if span.meta.get("role", "threshold") != "threshold":
+            continue
+        field = span.meta.get("field")
+        if not field:
+            return False
+        if str(field) not in semantic_fields:
+            return False
     return True
 
 

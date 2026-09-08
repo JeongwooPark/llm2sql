@@ -181,16 +181,25 @@ def is_chart_series_filter_question(question: str) -> bool:
         return False
     if re.search(r"(?:있|없)지만", q):
         return False
+    chartish = any(k in q for k in ("차트", "그래프", "그려", "시각화", "만으로"))
     from txt2sql.query_understanding.contract import extract_contract
 
-    if extract_contract(q).wants_count:
+    contract = extract_contract(q)
+    if contract.wants_count and not chartish:
         return False
-    if extract_contract(q).operation in {"list", "group", "group_rank", "rank"}:
+    if contract.operation in {"list", "group", "group_rank", "rank"} and not chartish:
         return False
     has_metric = any(any(k in q for k in keys) for keys, _ in _SERIES_FILTERS)
     if not has_metric:
         return False
     q_man = q.replace("미만", "\u0000")
+    # 「금정구의 것만」「데이터 중 ~만」은 행/지역 필터이지 차트 시리즈가 아님
+    if not chartish and (
+        re.search(r"의\s*것만", q)
+        or re.search(r"것만(?:\s|$)", q)
+        or ("데이터 중" in q and "만" in q_man)
+    ):
+        return False
     onlyish = any(
         k in q
         for k in (
@@ -208,7 +217,7 @@ def is_chart_series_filter_question(question: str) -> bool:
             "만으로 차트",
             "만으로 그려",
         )
-    ) or bool(re.search(r"[가-힣0-9]만(?:으로|으)?(?:\s|$)", q_man))
+    ) or bool(re.search(r"(?<!것)[가-힣0-9]만(?:으로|으)?(?:\s|$)", q_man))
     if re.search(r"(이상|이하|초과|미만)만", q):
         return False
     if not onlyish and "만" not in q_man:
@@ -345,7 +354,156 @@ def infer_chart_rebuild_route(
         and any(k in first for k in ("avg_far", "avg_height", "avg_area", "avg_floors"))
     ):
         return "building_profile_compare"
+    if len(rows) >= 2 and _named_dataset_chartable(first):
+        return "named_dataset_attr"
     return None
+
+
+def _named_dataset_chartable(row: dict[str, Any]) -> bool:
+    has_name = any(k in row for k in ("ADM_NM", "adm_nm", "label", "name"))
+    if not has_name:
+        return False
+    skip = {
+        "ADM_NM",
+        "adm_nm",
+        "label",
+        "name",
+        "BASE_DATE",
+        "ADM_CD",
+        "sigungu_cd",
+        "sgis_cd",
+        "admdong_cd",
+        "geometry",
+    }
+    for key, raw in row.items():
+        if key in skip:
+            continue
+        try:
+            float(raw)
+            return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _chart_from_named_dataset_rows(
+    rows: list[dict[str, Any]],
+    *,
+    question: str = "",
+) -> dict[str, Any] | None:
+    """ADM_NM + 수치 컬럼(n10/urban_pc 등) 목록을 막대 차트로."""
+    if len(rows) < 2:
+        return None
+    first = rows[0]
+    name_key = next(
+        (k for k in ("ADM_NM", "adm_nm", "label", "name") if k in first),
+        None,
+    )
+    if not name_key:
+        return None
+    skip = {
+        name_key,
+        "BASE_DATE",
+        "ADM_CD",
+        "sigungu_cd",
+        "sgis_cd",
+        "admdong_cd",
+        "geometry",
+        "ha",
+        "sqkm",
+        "area_m2",
+    }
+    metric_keys: list[str] = []
+    for key, raw in first.items():
+        if key in skip:
+            continue
+        try:
+            float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            continue
+        else:
+            if raw is not None:
+                metric_keys.append(str(key))
+    if not metric_keys:
+        return None
+    qn = question or ""
+    preferred = None
+    ratio_keys = ("_per_m2", "_per_ha", "_per_sqkm", "_per_area")
+    wants_ratio = any(k in qn for k in ("면적대비", "면적 대비", "면적당", "밀도"))
+
+    def _first_ratio(keys: list[str]) -> str | None:
+        for key in keys:
+            if key.endswith(ratio_keys):
+                return key
+        return None
+
+    if wants_ratio:
+        preferred = _first_ratio(metric_keys)
+    if preferred is None:
+        for key in metric_keys:
+            if key.lower() in qn.lower() or key in qn:
+                preferred = key
+                break
+    if preferred is None:
+        preferred = _first_ratio(metric_keys)
+    if preferred is None:
+        # 연령대·인구 계열 우선
+        for key in metric_keys:
+            if re.fullmatch(r"n\d{2}(?:_day|_night|_late)?", key, flags=re.I):
+                preferred = key
+                break
+    if preferred is None:
+        for key in ("urban_pc", "urban_area", "tot", "den_tot"):
+            if key in metric_keys:
+                preferred = key
+                break
+    if preferred is None:
+        preferred = metric_keys[0]
+
+    labels: list[str] = []
+    values: list[float] = []
+    for row in rows:
+        name = row.get(name_key)
+        raw = row.get(preferred)
+        if name is None or raw is None:
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        labels.append(str(name).strip())
+        values.append(val)
+    if len(labels) < 2:
+        return None
+    cap = 40
+    label_name = preferred
+    unit = ""
+    m_age = re.fullmatch(r"n(\d{2})", preferred, flags=re.I)
+    m_per = re.fullmatch(r"n(\d{2})_per_(m2|ha|sqkm|area)", preferred, flags=re.I)
+    if m_per:
+        age = m_per.group(1)
+        denom = m_per.group(2)
+        unit = {
+            "m2": "명/㎡",
+            "ha": "명/ha",
+            "sqkm": "명/㎢",
+            "area": "명/면적",
+        }.get(denom, "")
+        label_name = f"{age}대 면적당 활동인구"
+    elif m_age:
+        label_name = f"{m_age.group(1)}대 활동인구"
+    elif preferred == "urban_pc":
+        label_name = "1인당 시가화용지"
+    elif preferred == "urban_area":
+        label_name = "시가화용지 면적"
+    return {
+        "type": "bar",
+        "title": _title_from_question(question, label_name),
+        "labels": labels[:cap],
+        "datasets": [{"label": label_name, "data": values[:cap]}],
+        "all_datasets": [{"label": label_name, "data": values[:cap]}],
+        "unit": unit,
+    }
 
 
 def is_chart_capability_question(question: str) -> bool:
@@ -446,6 +604,30 @@ def build_chart_spec(
             unit="동",
         )
 
+    if route == "semantic_plan_aggregate":
+        # bins / group_by 구간·그룹 집계 → bar/doughnut (스칼라 1행은 차트 생략)
+        if len(rows) >= 2:
+            chart = _chart_from_named_counts(
+                rows,
+                name_keys=(
+                    "usage",
+                    "legal_dong",
+                    "structure",
+                    "ground_floors",
+                    "sigungu_name",
+                    "gross_floor_area_m2",
+                    "height_m",
+                    "range",
+                ),
+                title=_title_from_question(question, "구간·그룹 집계"),
+                chart_type="bar",
+                dataset_label="건물 수",
+                unit="동",
+            )
+            if chart:
+                return chart
+        return None
+
     if route in {"building_profile", "building_profile_compare"}:
         usage_chart = _chart_from_named_counts(
             rows,
@@ -511,6 +693,9 @@ def build_chart_spec(
             "all_datasets": [{"label": "건축물 수(동)", "data": values[:cap]}],
             "unit": "동",
         }
+
+    if route.startswith("named_dataset"):
+        return _chart_from_named_dataset_rows(rows, question=question)
 
     return None
 

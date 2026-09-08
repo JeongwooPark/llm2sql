@@ -23,7 +23,7 @@
 ## ADR-0004 평가 로직은 `txt2sql.evaluation`에 두고 스크립트는 CLI만 담당한다
 
 - 상태: accepted
-- 맥락: 작업지시서는 `scripts/eval_*.py`를 요구하지만 단위 테스트가 필요함
+- 맥락: 당시 지시 문서는 `scripts/eval_*.py`를 요구했지만 단위 테스트가 필요함
 - 결정: 비교·taxonomy·jsonl IO는 패키지에 두고 `scripts/eval_plan.py`, `scripts/eval_nl2sql.py`, `scripts/compare_runs.py`는 CLI
 - SQL 토큰 존재는 정답 조건이 아님. smoke 30/100은 `status=draft` candidate만 import
 

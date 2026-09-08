@@ -10,7 +10,7 @@
 | 본 보고서 범위 | **개선·신규 알고리즘** (의도 하이브리드, 규칙 SQL 라우터, 스키마 RAG, Text-to-SQL 검증 루프, 지명 사전, 세션·모호성, 단위 정규화, 지도 발행) |
 | 선행 보고서 | `llm2_geodb/docs/RND_대화형GIS해석_알고리즘_연구결과보고서.md` |
 | 구현 스택 | Ollama(로컬 LLM·임베딩) · PostgreSQL/PostGIS · FastAPI/CLI · GeoServer(선택) · sqlglot |
-| 현재 제품 | **txt2sql 0.3.2** (SQP v1.1, Query Contract·plan repair, 기본 `hybrid`). 본문은 0.1.4 알고리즘을 보존한다. 복합조건·SQP는 [§9.4](#94-semantic-query-plan-022-추가)와 부록 C를 본다 |
+| 현재 제품 | **txt2sql 0.3.3** (SQP v1.1, Query Contract·plan repair, 기본 `hybrid`). 본문은 0.1.4 알고리즘을 보존한다. 복합조건·SQP는 [§9.4](#94-semantic-query-plan-022-추가)와 부록 C를 본다 |
 
 > **문서 성격**: 이 보고서는 고도화 연구 당시(v0.1.4)의 알고리즘을 고정한 기록이다. 제품 동작·설정·복합질의는 `README.md`, `docs/작동방식_및_알고리즘.md`, `docs/Semantic_Query_Plan_구현.md`가 우선한다.
 
@@ -982,8 +982,8 @@ SQL 생성 시스템 프롬프트의 하드 제약: 한글 테이블명 금지, 
 
 - `llm2_geodb/docs/RND_대화형GIS해석_알고리즘_연구결과보고서.md` — 선행 대화 계층
 - `llm2sql/docs/고도화_llm2_geodb_to_txt2sql.md` — 기능 대조·모듈 매핑
-- `llm2sql/docs/작동방식_및_알고리즘.md` — 0.3.2 시나리오 설명
+- `llm2sql/docs/작동방식_및_알고리즘.md` — 0.3.3 시나리오 설명
 - `llm2sql/docs/Semantic_Query_Plan_구현.md` — SQP 명세 (기본 `hybrid`)
-- `llm2sql/README.md` — 사용·파이프라인 요약 (버전 **0.3.2**, SQP v1.1)
-- `llm2sql/docs/20260904_txt2sql_v0.3.2.md` — 0.3.2 PlaceScope·Contract·repair
+- `llm2sql/README.md` — 사용·파이프라인 요약 (버전 **0.3.3**, SQP v1.1)
+- `llm2sql/docs/20260908_txt2sql_v0.3.3.md` — 0.3.3 PlaceScope·Contract·repair
 - `llm2sql/docs/20260825_txt2sql_v0.3.0.md` — 0.3.0 데이터·지도 변경

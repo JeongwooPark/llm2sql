@@ -15,9 +15,11 @@ import psycopg
 from txt2sql.config import Settings
 from txt2sql.domain import (
     LENGTH_DIST_PATTERN,
+    assumptions_include_permit_lag,
     d198_gu_for_dong,
     d198_table_for_gu,
     d198_unavailable_reason,
+    exact_structure_label,
     extract_gu,
     extract_industrial_name,
     extract_industrial_names,
@@ -43,6 +45,7 @@ from txt2sql.semantic_plan.migrate import filter_to_predicate, migrate_plan_v11
 from txt2sql.semantic_plan.predicate_utils import effective_predicate, has_op
 from txt2sql.semantic_plan.models import (
     AggregationSpec,
+    BinSpec,
     ExpressionSpec,
     FilterSpec,
     OperandSpec,
@@ -55,6 +58,7 @@ from txt2sql.semantic_plan.models import (
     SemanticQueryPlan,
     SpatialRelationSpec,
     SpatialTargetSpec,
+    StageSpec,
 )
 from txt2sql.semantic_plan.prompts import build_messages
 from txt2sql.session import SessionContext
@@ -209,14 +213,17 @@ def extract_plan_hints(question: str) -> dict[str, Any]:
     if not any(item["field"] == "ground_floors" for item in numerics):
         floor_m = re.search(r"(\d+)\s*층\s*[을를]?\s*(이상|이하|초과|미만|넘는)", q)
         if floor_m and "지하" not in q[max(0, floor_m.start() - 4) : floor_m.start()]:
-            numerics.append(
-                {
-                    "field": "ground_floors",
-                    "operator": _REL.get(floor_m.group(2), "gte"),
-                    "value": int(floor_m.group(1)),
-                    "unit": "floor",
-                }
-            )
+            # 「10배」는 층수 임계가 아님
+            after = q[floor_m.end(1) : floor_m.end(1) + 2]
+            if "배" not in after:
+                numerics.append(
+                    {
+                        "field": "ground_floors",
+                        "operator": _REL.get(floor_m.group(2), "gte"),
+                        "value": int(floor_m.group(1)),
+                        "unit": "floor",
+                    }
+                )
     if not numerics:
         bare = re.search(
             rf"(\d+(?:\.\d+)?)\s*(킬로미터|㎞|km|미터|m)\s*[을를]?\s*(이상|이하|초과|미만|넘는)",
@@ -347,6 +354,25 @@ def extract_plan_hints(question: str) -> dict[str, Any]:
         extra_filters.append(
             {"field": "ledger_kind", "operator": "eq", "value": "일반건축물대장"}
         )
+    if any(k in q for k in ("집합건축물", "집합건물")) and "일반건축물" not in q:
+        extra_filters.append(
+            {
+                "field": "complex_building_kind",
+                "operator": "eq",
+                "value": "집합건축물",
+            }
+        )
+    # 「높이는 있는데 지상층수가 없는」 presence/absence
+    if re.search(r"높이.{0,8}(있|기록).{0,12}(지상층|층수).{0,6}(없|NULL|null)", q) or (
+        "높이는 있" in q
+        and any(k in q for k in ("지상층수가 없", "층수가 없", "지상층수 없"))
+    ):
+        extra_filters.append(
+            {"field": "height_m", "operator": "is_not_null", "value": None}
+        )
+        extra_filters.append(
+            {"field": "ground_floors", "operator": "is_null", "value": None}
+        )
     if any(k in q for k in ("기록된", "모두 있는")):
         if "건폐율" in q:
             extra_filters.append(
@@ -355,6 +381,10 @@ def extract_plan_hints(question: str) -> dict[str, Any]:
         if "용적" in q:
             extra_filters.append(
                 {"field": "floor_area_ratio", "operator": "gt", "value": 0}
+            )
+        if any(k in q for k in ("사용승인", "건축연령", "준공")):
+            extra_filters.append(
+                {"field": "approval_date", "operator": "is_not_null", "value": None}
             )
     return {
         "place": place or gu,
@@ -371,7 +401,27 @@ def extract_plan_hints(question: str) -> dict[str, Any]:
         "distance_outside": any(
             k in q for k in ("경계 밖", "바깥", "외부", "밖에")
         ),
-        "boundary": any(k in q for k in ("안에", "내부", "경계 안", "경계안", "안쪽")),
+        "boundary": any(
+            k in q
+            for k in (
+                "행정동",
+                "안에",
+                "안의",
+                "내부",
+                "경계 안",
+                "경계안",
+                "안쪽",
+                "반경",
+            )
+        )
+        or bool(re.search(r"[동읍면]\s*안(?:에|의|쪽)?(?:\s|$)", q))
+        # 「N년 이내」시차는 공간 boundary가 아님. 거리 단위+이내만 공간.
+        or bool(
+            re.search(
+                r"\d+(?:\.\d+)?\s*(?:m|M|미터|km|킬로미터|㎞)\s*이내",
+                q,
+            )
+        ),
         "scope_gu": gu if place and gu and place != gu else None,
         "industrial_name": industrial_name,
         "industrial_names": industrial_names,
@@ -449,6 +499,7 @@ def try_heuristic_plan(
     if (
         "면적" in q
         and "기초구역" not in q
+        and "산업단지" not in q
         and not any(k in q for k in ("연면적", "건축면적", "건물면적", "건축물면적", "대지면적"))
         and not any(
             item.get("field") in {
@@ -459,12 +510,16 @@ def try_heuristic_plan(
             for item in (hints.get("numeric_expressions") or [])
         )
     ):
-        return SemanticQueryPlan(
-            query_kind="list",
-            entity="building",
-            requires_clarification=True,
-            ambiguities=["면적이 건축면적·연면적·대지면적 중 어떤 것인지 필요합니다"],
-        )
+        from txt2sql.place_area_qa import is_place_boundary_area_question
+
+        # 행정·법정동·시·구 경계 면적은 건물 면적 clarify 대상이 아님
+        if not is_place_boundary_area_question(q):
+            return SemanticQueryPlan(
+                query_kind="list",
+                entity="building",
+                requires_clarification=True,
+                ambiguities=["면적이 건축면적·연면적·대지면적 중 어떤 것인지 필요합니다"],
+            )
     if ("허가일" in q or "허가일자" in q) and "사용승인" not in q:
         gu_name = hints.get("place") if hints.get("place_kind") == "gu" else extract_gu(q)
         if gu_name and d198_table_for_gu(gu_name) is None and not is_busan_wide(q):
@@ -493,6 +548,7 @@ def try_heuristic_plan(
         and not bound.derived_metrics
         and not bound.ratios
         and not bound.group_fields
+        and not any(k in q for k in ("각 구", "구·군", "구군별", "차이"))
     ):
         return None
     if _catalog_owns_d060_only(q):
@@ -512,6 +568,13 @@ def try_heuristic_plan(
             "높이",
             "연면적",
             "건축면적",
+            "건축물면적",
+            "대지면적",
+            "건축연령",
+            "분위수",
+            "분위",
+            "분산",
+            "표준편차",
             "사용승인",
             "년대",
             "허가",
@@ -523,6 +586,11 @@ def try_heuristic_plan(
             "산지",
             "구조별",
             "법정동별",
+            "구·군",
+            "구군",
+            "차이",
+            "최대",
+            "평균",
         )
     ):
         if (
@@ -534,12 +602,14 @@ def try_heuristic_plan(
             and not hints.get("ratio")
             and not hints.get("extra_filters")
             and not temporal_filters
+            and not any(k in q for k in ("구·군", "구군", "각 구", "차이"))
         ):
             return None
 
     query_kind = _guess_kind(q)
     filters: list[FilterSpec] = []
     predicate: PredicateSpec | None = None
+    assumptions: list[str] = ["heuristic_plan"]
     or_tokens = ("또는", "혹은", "이거나", "둘 중 하나")
     not_tokens = ("제외", "아닌", "빼고", "뺀", "이외")
     usages = list(hints.get("usages") or [])
@@ -564,7 +634,30 @@ def try_heuristic_plan(
         # 비커버 지역: D010 주요용도만 사용 (아파트→공동주택)
         detail_usages = []
     dual_subset_usage = _dual_count_subset_usage(q, usages)
-    if dual_subset_usage:
+    # 「세부용도가 아파트인데 주요용도가 공동주택이 아닌」
+    detail_vs_usage = re.search(
+        r"세부용도.{0,8}(?P<detail>아파트|오피스텔|다세대주택|일반음식점).{0,16}"
+        r"주요용도.{0,8}(?P<main>공동주택|단독주택|제1종근린생활시설|제2종근린생활시설|판매시설)"
+        r".{0,6}아닌",
+        q,
+    )
+    if detail_vs_usage:
+        detail_val = detail_vs_usage.group("detail")
+        main_val = detail_vs_usage.group("main")
+        predicate = _and_pred(
+            _field_eq("detail_usage", detail_val),
+            PredicateSpec(op="not", args=[_usage_eq(main_val)]),
+        )
+        filters = [
+            item
+            for item in filters
+            if item.field not in {"usage", "detail_usage"}
+        ]
+        usages = []
+        detail_usages = []
+        if "d198_ledger" not in assumptions:
+            assumptions.append("d198_ledger")
+    elif dual_subset_usage:
         usages = []
     neg_usages = [u for u in usages if _term_is_negated(q, u)]
     pos_usages = [u for u in usages if u not in neg_usages]
@@ -606,6 +699,25 @@ def try_heuristic_plan(
                 )
             ],
         )
+    elif (
+        re.search(r"도\s*.{0,12}도\s*아닌|도\s*아니고", q)
+        and len(usages) >= 2
+    ):
+        # 「단독주택도 공동주택도 아닌」
+        predicate = PredicateSpec(
+            op="not",
+            args=[
+                PredicateSpec(
+                    op="or",
+                    args=[_usage_eq(value) for value in usages],
+                )
+            ],
+        )
+        if usage_classes:
+            predicate = _and_pred(
+                _field_eq("usage_class", usage_classes[0]),
+                predicate,
+            )
     elif any(k in q for k in not_tokens) and len(usages) >= 2 and not pos_usages:
         predicate = PredicateSpec(
             op="not",
@@ -663,6 +775,7 @@ def try_heuristic_plan(
         filters.append(
             FilterSpec(field="usage_class", operator="eq", value=usage_classes[0])
         )
+    dual_usage_class_aggs = _dual_usage_class_metric_aggs(q, usage_classes)
     compare = _extract_field_compare(q)
     if compare is not None:
         filters.append(compare)
@@ -694,9 +807,19 @@ def try_heuristic_plan(
                 PredicateSpec(op="not", args=[_structure_contains(neg_val)]),
             )
         else:
-            filters.append(
-                FilterSpec(field="structure", operator="contains", value=hints["structure"])
-            )
+            exact = exact_structure_label(q, str(hints["structure"]))
+            if exact:
+                filters.append(
+                    FilterSpec(field="structure", operator="eq", value=exact)
+                )
+            else:
+                filters.append(
+                    FilterSpec(
+                        field="structure",
+                        operator="contains",
+                        value=hints["structure"],
+                    )
+                )
     for item in hints.get("numeric_expressions") or []:
         filters.append(
             FilterSpec(
@@ -721,6 +844,17 @@ def try_heuristic_plan(
     scope = None
     spatial_relations: list[SpatialRelationSpec] = []
     distance_m = hints.get("distance_m")
+    scope_gu = hints.get("scope_gu")
+    if isinstance(scope_gu, str) and not scope_gu.strip():
+        scope_gu = None
+
+    def _place_spec(name: str, kind: str) -> PlaceSpec:
+        return PlaceSpec(
+            name=name,
+            kind=kind,  # type: ignore[arg-type]
+            sigungu=scope_gu if kind in {"legal_dong", "admin_dong", "unknown"} else None,
+        )
+
     if place_name:
         kind = hints.get("place_kind") or "unknown"
         if kind not in {"sido", "gu", "legal_dong", "admin_dong", "basic_zone", "unknown"}:
@@ -731,18 +865,18 @@ def try_heuristic_plan(
                 SpatialRelationSpec(
                     relation=relation,
                     target=SpatialTargetSpec(
-                        place=PlaceSpec(name=place_name, kind=kind)
+                        place=_place_spec(place_name, kind)
                     ),
                     distance_m=float(distance_m),
                 )
             )
             scope = ScopeSpec(
-                place=PlaceSpec(name=place_name, kind=kind),
+                place=_place_spec(place_name, kind),
                 spatial_mode="auto",
             )
         else:
             mode = "boundary" if hints.get("boundary") else "auto"
-            scope = ScopeSpec(place=PlaceSpec(name=place_name, kind=kind), spatial_mode=mode)
+            scope = ScopeSpec(place=_place_spec(place_name, kind), spatial_mode=mode)
 
     industrial_names = list(hints.get("industrial_names") or [])
     industrial_name = hints.get("industrial_name")
@@ -794,6 +928,8 @@ def try_heuristic_plan(
     order_by: list[OrderSpec] = []
     aggregations: list[AggregationSpec] = []
     group_by: list[str] = []
+    bins: list[BinSpec] = []
+    stages: list[StageSpec] = []
     limit = _extract_limit(q)
     decade_group = False
 
@@ -892,6 +1028,20 @@ def try_heuristic_plan(
                             field=date_fields[0], direction="desc", nulls="last"
                         )
                     ]
+                elif any(
+                    item.field in {"usage", "usage_class", "detail_usage"}
+                    for item in filters
+                ) or (
+                    predicate is not None
+                    and predicate.op in {"or", "not", "and"}
+                ):
+                    # 용도 필터 목록: 골드·D198은 연면적 DESC가 상위명과 맞음
+                    order_metric = "gross_floor_area_m2"
+                    if order_metric not in select:
+                        select.append(order_metric)
+                    order_by = [
+                        OrderSpec(field=order_metric, direction="desc", nulls="last")
+                    ]
                 else:
                     order_by = [OrderSpec(field="id", direction="desc", nulls="last")]
         if limit is None and any(k in q for k in ("보여", "찾아", "목록", "나열")):
@@ -906,6 +1056,9 @@ def try_heuristic_plan(
                     AggregationSpec(function="count", field=None, alias="n")
                 )
                 continue
+            # percentile/ratio는 아래 contract_extra 경로에서 값을 채운다.
+            if fn in {"percentile", "ratio", "derived"}:
+                continue
             for metric in metrics:
                 aggregations.append(
                     AggregationSpec(
@@ -914,7 +1067,27 @@ def try_heuristic_plan(
                         alias=f"{fn}_{metric}",
                     )
                 )
-        if any(k in q for k in ("용도별", "구조별", "법정동별", "구별")):
+        # 「양수 … 최소/최대」— 측정값 > 0
+        if "양수" in q:
+            for metric in metrics:
+                if metric in {
+                    "building_area_m2",
+                    "gross_floor_area_m2",
+                    "site_area_m2",
+                    "height_m",
+                    "ground_floors",
+                } and not any(f.field == metric for f in filters):
+                    filters.append(
+                        FilterSpec(field=metric, operator="gt", value=0)
+                    )
+        # avg/sum/min/max 스칼라에 n 동반
+        if aggregations and not any(
+            (a.function or "").lower() == "count" for a in aggregations
+        ):
+            aggregations.append(
+                AggregationSpec(function="count", field=None, alias="n")
+            )
+        if any(k in q for k in ("용도별", "세부용도별", "구조별", "법정동별", "구별")):
             query_kind = "aggregate"
             if "구조별" in q:
                 group_by = ["structure"]
@@ -922,6 +1095,8 @@ def try_heuristic_plan(
                 group_by = ["legal_dong"]
             elif "구별" in q:
                 group_by = ["sigungu_name"]
+            elif "세부용도별" in q:
+                group_by = ["detail_usage"]
             else:
                 group_by = ["usage"]
     elif query_kind == "distribution":
@@ -951,7 +1126,8 @@ def try_heuristic_plan(
                 limit = 100
 
     entity: str = "building"
-    assumptions = ["heuristic_plan"]
+    if "heuristic_plan" not in assumptions:
+        assumptions.insert(0, "heuristic_plan")
     if hints.get("scope_gu"):
         assumptions.append(f"scope_gu:{hints['scope_gu']}")
     if any(k in q for k in ("중심에서", "중심으로부터", "중심 기준")):
@@ -998,12 +1174,7 @@ def try_heuristic_plan(
         ):
             assumptions.append("permit_approval_year_neq")
     # 시차 assumption이 있으면 잘못된 age/rel_years 필터 제거
-    if any(
-        a.startswith("permit_day_gap_")
-        or a in {"permit_after_approval", "permit_approval_year_neq"}
-        or a.startswith("permit_year_gap:")
-        for a in assumptions
-    ):
+    if assumptions_include_permit_lag(assumptions):
         filters = [
             item
             for item in filters
@@ -1033,21 +1204,52 @@ def try_heuristic_plan(
         order_by = [OrderSpec(field="approval_date", direction="asc", nulls="last")]
         limit = None
     if bound.fixed_bins and not decade_group:
-        bin_field = None
-        bin_width = None
-        for span in bound.numbers:
-            field = span.meta.get("field")
-            if field and span.value:
-                bin_field = str(field)
-                bin_width = float(span.value)
-                break
-        if bin_field and bin_width and bin_width > 0:
-            group_by = [bin_field]
-            assumptions.append(f"width_bucket:{bin_field}:{bin_width:g}")
-            aggregations = [AggregationSpec(function="count", field=None, alias="n")]
+        edge_bin = _edge_bin_from_contract(q, bound)
+        if edge_bin is not None:
+            bins = [edge_bin]
+            group_by = [edge_bin.field]
+            aggregations = _metric_group_aggregations(q)
+            if not any(a.function == "count" for a in aggregations):
+                aggregations.insert(
+                    0, AggregationSpec(function="count", field=None, alias="n")
+                )
             query_kind = "aggregate"
-            order_by = [OrderSpec(field=bin_field, direction="asc", nulls="last")]
+            order_by = []
             limit = None
+            # 구간 분할이면 개별 임계 필터를 WHERE에 두지 않는다.
+            filters = [
+                item
+                for item in filters
+                if item.field != edge_bin.field
+                or item.operator
+                not in {"lt", "lte", "gt", "gte", "between", "eq"}
+            ]
+            assumptions.append(f"edge_bins:{edge_bin.field}")
+        else:
+            bin_field = None
+            bin_width = None
+            for span in bound.numbers:
+                field = span.meta.get("field")
+                if field and span.value:
+                    bin_field = str(field)
+                    bin_width = float(span.value)
+                    break
+            if bin_field and bin_width and bin_width > 0:
+                group_by = [bin_field]
+                # Prefer explicit BinSpec; keep width_bucket assumption for older consumers.
+                bins = [BinSpec(field=bin_field, width=bin_width)]
+                assumptions.append(f"width_bucket:{bin_field}:{bin_width:g}")
+                aggregations = [AggregationSpec(function="count", field=None, alias="n")]
+                query_kind = "aggregate"
+                order_by = [OrderSpec(field=bin_field, direction="asc", nulls="last")]
+                limit = None
+                filters = [
+                    item
+                    for item in filters
+                    if item.field != bin_field
+                    or item.operator
+                    not in {"lt", "lte", "gt", "gte", "between", "eq"}
+                ]
     if hints.get("basic_zone"):
         entity = "basic_zone"
         filters = [
@@ -1056,6 +1258,21 @@ def try_heuristic_plan(
             else item
             for item in filters
         ]
+        # 동·구와 겹치는 기초구역 → admin spatial (속성 LIKE 금지)
+        if place_name and any(k in q for k in ("겹치", "교차", "걸치", "일부")):
+            kind = hints.get("place_kind") or "admin_dong"
+            if kind not in {"sido", "gu", "legal_dong", "admin_dong", "unknown"}:
+                kind = "unknown"
+            spatial_relations = [
+                SpatialRelationSpec(
+                    relation="intersects",
+                    target=SpatialTargetSpec(
+                        entity="admin_area",
+                        place=_place_spec(str(place_name), kind),
+                    ),
+                )
+            ]
+            scope = None
         if "이동사유별" in q or ("이동사유" in q and "별" in q):
             query_kind = "aggregate"
             group_by = ["move_reason"]
@@ -1075,6 +1292,20 @@ def try_heuristic_plan(
             select = []
             order_by = []
             limit = None
+        elif any(k in q for k in AGG_MAP) or query_kind == "aggregate":
+            query_kind = "aggregate"
+            function = _aggregate_function(q)
+            aggregations = [
+                AggregationSpec(
+                    function=function,
+                    field="area_m2",
+                    alias=f"{function}_area_m2",
+                ),
+                AggregationSpec(function="count", field=None, alias="n"),
+            ]
+            select = []
+            order_by = []
+            limit = None
         else:
             query_kind = "rank"
             order_by = [OrderSpec(field="area_m2", direction="desc", nulls="last")]
@@ -1082,6 +1313,168 @@ def try_heuristic_plan(
             aggregations = []
             if limit is None:
                 limit = 1
+    # 산업단지 면적 평균/합계 (건물 교차 아님)
+    if (
+        "산업단지" in q
+        and "면적" in q
+        and not any(k in q for k in ("건물", "건축물", "공장", "내부", "안 "))
+        and any(k in q for k in ("평균", "합계", "총합", "합 "))
+    ):
+        entity = "industrial_complex"
+        query_kind = "aggregate"
+        function = _aggregate_function(q)
+        if function not in {"avg", "sum", "min", "max"}:
+            function = "avg" if "평균" in q else "sum"
+        aggregations = [
+            AggregationSpec(
+                function=function,
+                field="area_m2",
+                alias=f"{function}_area_m2",
+            ),
+            AggregationSpec(function="count", field=None, alias="n"),
+        ]
+        select = []
+        order_by = []
+        limit = None
+        spatial_relations = []
+        if is_busan_wide(q) or (hints.get("place_kind") == "sido"):
+            scope = ScopeSpec(
+                place=PlaceSpec(name="부산", kind="sido"),
+                spatial_mode="auto",
+            )
+        filters = []
+    # 법정동별 건물 수 상위 N (최근 N년 준공 등 temporal filter 유지)
+    if (
+        "법정동" in q
+        and any(k in q for k in ("많은", "상위", "순위"))
+        and any(k in q for k in ("건물", "건축물", "채", "건수"))
+        and "비율" not in q
+        and entity == "building"
+    ):
+        query_kind = "aggregate"
+        group_by = ["legal_dong"]
+        aggregations = [AggregationSpec(function="count", field=None, alias="n")]
+        order_by = [OrderSpec(field="n", direction="desc", nulls="last")]
+        select = []
+        if limit is None:
+            limit = _extract_limit(q) or 5
+        if any(k in q for k in ("사용승인", "준공", "건축연령", "허가")):
+            if "d198_ledger" not in assumptions:
+                assumptions.append("d198_ledger")
+    # 허가일→사용승인일 소요 일수 중앙값/표준편차/평균
+    if (
+        "허가" in q
+        and any(k in q for k in ("사용승인", "준공"))
+        and (
+            "일수" in q
+            or ("평균" in q and any(k in q for k in ("걸린", "기간", "허가 후")))
+        )
+        and any(k in q for k in ("중앙값", "표준편차", "평균"))
+    ):
+        from txt2sql.semantic_plan.models import ExpressionSpec
+
+        query_kind = "aggregate"
+        if "중앙값" in q:
+            fn, alias = "median", "median_days"
+        elif "표준편차" in q:
+            fn, alias = "stddev", "std_days"
+        else:
+            fn, alias = "avg", "avg_days"
+        day_expr = ExpressionSpec(
+            kind="subtract",
+            left=ExpressionSpec(kind="field", field="approval_date"),
+            right=ExpressionSpec(kind="field", field="permit_date"),
+        )
+        aggregations = [
+            AggregationSpec(
+                function=fn,
+                field=None,
+                alias=alias,
+                expression=day_expr,
+            ),
+            AggregationSpec(function="count", field=None, alias="n"),
+        ]
+        select = []
+        order_by = []
+        limit = None
+        if "d198_ledger" not in assumptions:
+            assumptions.append("d198_ledger")
+    # 허가→준공 기간 최장/최단 목록
+    if (
+        "허가" in q
+        and any(k in q for k in ("사용승인", "준공"))
+        and any(k in q for k in ("기간", "걸린"))
+        and any(k in q for k in ("가장 긴", "제일 긴", "가장 짧", "제일 짧", "최장", "최단"))
+    ):
+        query_kind = "list"
+        select = ["name", "legal_dong", "lot_address", "permit_date", "approval_date"]
+        direction = (
+            "asc"
+            if any(k in q for k in ("가장 짧", "제일 짧", "최단"))
+            else "desc"
+        )
+        assumptions.append(f"order_by_day_gap:{direction}")
+        if "d198_ledger" not in assumptions:
+            assumptions.append("d198_ledger")
+        order_by = []
+        if limit is None:
+            limit = _extract_limit(q) or 10
+        # day-gap 유효 행만 (「양수 기간」은 0일 제외)
+        if not any(a.startswith("permit_day_gap_") for a in assumptions):
+            if "양수" in q:
+                assumptions.append("permit_day_gap_gte:1")
+            else:
+                assumptions.append("permit_day_gap_gte:0")
+    # 산업단지별 내부 건물 수 상위 N
+    if (
+        "산업단지" in q
+        and any(k in q for k in ("건물", "건축물"))
+        and any(k in q for k in ("상위", "많은", "순위"))
+        and any(k in q for k in ("단지", "공원", "산단"))
+        and not any(k in q for k in ("면적", "높이", "연면적"))
+    ):
+        query_kind = "aggregate"
+        entity = "building"
+        aggregations = [
+            AggregationSpec(function="count", field=None, alias="n"),
+        ]
+        group_by = []
+        assumptions.append("group_by_industrial_name")
+        spatial_relations = [
+            SpatialRelationSpec(
+                relation="intersects",
+                target=SpatialTargetSpec(entity="industrial_complex"),
+            )
+        ]
+        order_by = [OrderSpec(field="n", direction="desc", nulls="last")]
+        select = []
+        if limit is None:
+            limit = _extract_limit(q) or 10
+    # 건축연령 ↔ 연면적/층수 상관계수
+    if "상관" in q and any(k in q for k in ("건축연령", "경과년")):
+        query_kind = "aggregate"
+        y_field = "gross_floor_area_m2"
+        alias = "corr_age_gfa"
+        if any(k in q for k in ("지상층", "층수")):
+            y_field = "ground_floors"
+            alias = "corr_age_fl"
+        elif "높이" in q:
+            y_field = "height_m"
+            alias = "corr_age_h"
+        aggregations = [
+            AggregationSpec(
+                function="corr",
+                field="building_age_years",
+                filter_field=y_field,
+                alias=alias,
+            ),
+            AggregationSpec(function="count", field=None, alias="n"),
+        ]
+        select = []
+        order_by = []
+        limit = None
+        if "d198_ledger" not in assumptions:
+            assumptions.append("d198_ledger")
     if "구별" in q and entity == "building":
         query_kind = "aggregate"
         group_by = ["sigungu_name"]
@@ -1096,20 +1489,54 @@ def try_heuristic_plan(
         else:
             order_by = []
             limit = None
-    if any(k in q for k in ("구·군별", "군별")) and entity == "building":
+    if any(k in q for k in ("구·군별", "군별", "각 구·군", "각 구군", "구별로", "구별 ")) and entity == "building":
         query_kind = "aggregate"
         group_by = ["sigungu_name"]
         aggregations = _metric_group_aggregations(q)
         select = []
+        # 최대−평균 / 최대−최소양수 파생
+        if "차이" in q and any(k in q for k in ("최대", "평균", "최소")):
+            metric = _rank_metric(q)
+            if "높이" in q:
+                metric = "height_m"
+            elif "연면적" in q:
+                metric = "gross_floor_area_m2"
+            aggregations = [
+                AggregationSpec(function="max", field=metric, alias=f"max_{metric}"),
+                AggregationSpec(function="avg", field=metric, alias=f"avg_{metric}"),
+                AggregationSpec(function="count", field=None, alias="n"),
+            ]
+            if "양수" in q or ("최소" in q and "연면적" in q):
+                aggregations.insert(
+                    1,
+                    AggregationSpec(
+                        function="min",
+                        field=metric,
+                        alias=f"min_{metric}",
+                        predicate=PredicateSpec(
+                            op="cmp",
+                            operator="gt",
+                            left=OperandSpec(kind="field", field=metric),
+                            right=OperandSpec(kind="literal", value=0),
+                        ),
+                    ),
+                )
+            assumptions.append("gu_max_avg_diff")
         order_by = []
         limit = None
-    if any(k in q for k in ("구조별", "법정동코드별", "용도별", "법정동별")) and entity == "building":
+    if any(k in q for k in ("구조별", "법정동코드별", "용도별", "세부용도별", "법정동별", "건물용도분류별", "용도분류별")) and entity == "building":
         if "구조별" in q:
             group_field = "structure"
         elif "법정동코드별" in q:
             group_field = "bjd_cd"
         elif "법정동별" in q:
             group_field = "legal_dong"
+        elif "세부용도별" in q:
+            group_field = "detail_usage"
+        elif any(k in q for k in ("건물용도분류별", "용도분류별")):
+            group_field = "usage_class"
+            if "d198_ledger" not in assumptions:
+                assumptions.append("d198_ledger")
         else:
             group_field = "usage"
         query_kind = "aggregate"
@@ -1118,6 +1545,85 @@ def try_heuristic_plan(
         select = []
         order_by = []
         limit = None
+        if group_field == "detail_usage" and "d198_ledger" not in assumptions:
+            assumptions.append("d198_ledger")
+        # 구조별 비율 — answer 단계에서 share pct 부여
+        if group_field == "structure" and hints.get("ratio"):
+            aggregations = [AggregationSpec(function="count", field=None, alias="n")]
+            assumptions.append("group_share_pct")
+            if any(k in q for k in ("%", "백분율", "퍼센트")):
+                assumptions.append("group_share_percent")
+    if re.search(r"준공연도별", q) and any(k in q for k in ("건폐율", "용적률", "용적율", "평균")):
+        query_kind = "aggregate"
+        group_by = ["approval_date"]
+        metric = (
+            "building_coverage_ratio"
+            if "건폐" in q
+            else "floor_area_ratio"
+        )
+        aggregations = [
+            AggregationSpec(function="avg", field=metric, alias=f"avg_{metric}"),
+            AggregationSpec(function="count", field=None, alias="n"),
+        ]
+        select = []
+        order_by = [OrderSpec(field="approval_date", direction="asc", nulls="last")]
+        limit = None
+        if "d198_ledger" not in assumptions:
+            assumptions.append("d198_ledger")
+        assumptions.append("approval_year_group")
+        decade_group = False  # year not decade
+    # 법정동별 아파트(세부용도) 수 — A25 공동주택 오맵 방지
+    if (
+        "법정동별" in q
+        and "아파트" in q
+        and any(k in q for k in ("수", "집계", "몇"))
+        and "비율" not in q
+    ):
+        query_kind = "aggregate"
+        group_by = ["legal_dong"]
+        aggregations = [AggregationSpec(function="count", field=None, alias="n")]
+        filters = [
+            item
+            for item in filters
+            if item.field not in {"usage", "detail_usage"}
+        ]
+        filters.append(
+            FilterSpec(field="detail_usage", operator="eq", value="아파트")
+        )
+        select = []
+        order_by = [OrderSpec(field="n", direction="desc", nulls="last")]
+        if "d198_ledger" not in assumptions:
+            assumptions.append("d198_ledger")
+    # 산업단지별 내부 건물 수/평균연면적
+    if (
+        "산업단지별" in q
+        and any(k in q for k in ("건물", "건축물"))
+        and any(k in q for k in ("수", "집계", "평균", "연면적"))
+        and "경계" not in q
+    ):
+        query_kind = "aggregate"
+        group_by = []
+        assumptions.append("group_by_industrial_name")
+        if "평균" in q and "연면적" in q:
+            aggregations = [
+                AggregationSpec(
+                    function="avg",
+                    field="gross_floor_area_m2",
+                    alias="avg_gfa",
+                ),
+                AggregationSpec(function="count", field=None, alias="n"),
+            ]
+        else:
+            aggregations = [AggregationSpec(function="count", field=None, alias="n")]
+        select = []
+        order_by = [OrderSpec(field="n", direction="desc", nulls="last")]
+        limit = None
+        spatial_relations = [
+            SpatialRelationSpec(
+                relation="intersects",
+                target=SpatialTargetSpec(entity="industrial_complex"),
+            )
+        ]
     if re.search(r"(준공연대별|년대별)", q) and (
         len(re.findall(r"\d{4}년대", q)) >= 2 or "이전" in q
     ):
@@ -1183,6 +1689,11 @@ def try_heuristic_plan(
         else:
             ratios = _build_ratio_specs(q, filters)
             if ratios:
+                # 골드·일반 비율은 0~1 분수. 백분율/% 명시 시에만 ×100.
+                if not any(k in q for k in ("%", "백분율", "퍼센트", "프로")):
+                    ratios = [
+                        item.model_copy(update={"multiplier": 1.0}) for item in ratios
+                    ]
                 ratio_fields: set[str] = set()
                 for item in ratios:
                     ratio_fields.update(_pred_field_names(item.numerator_predicate))
@@ -1196,7 +1707,44 @@ def try_heuristic_plan(
                 k in q for k in ("건수", "채수", "몇 채", "몇채")
             ):
                 aggregations = []
+                # 조건부 비율은 분모 건수를 함께 반환 (스칼라 골드 n=…)
+                if ratios and any(
+                    item.denominator_predicate is not None for item in ratios
+                ):
+                    den_pred = next(
+                        item.denominator_predicate
+                        for item in ratios
+                        if item.denominator_predicate is not None
+                    )
+                    aggregations = [
+                        AggregationSpec(
+                            function="count",
+                            field=None,
+                            alias="n",
+                            predicate=den_pred,
+                        )
+                    ]
+            # 위반건축물 비율은 D010 A20 — D198 A20(용적율)과 충돌 방지
+            if ratios and any(
+                "violation_status" in _pred_field_names(item.numerator_predicate)
+                or (
+                    item.denominator_predicate is not None
+                    and "violation_status"
+                    in _pred_field_names(item.denominator_predicate)
+                )
+                for item in ratios
+            ):
+                assumptions = [a for a in assumptions if a != "d198_ledger"]
+                if "d010_gis" not in assumptions:
+                    assumptions.append("d010_gis")
     contract_extra = bound_contract if bound_contract is not None else extract_contract(q)
+    # 연도 꼬리(최근 준공 상위 N% … 평균)는 전용 SQL — 잘못된 height percentile 방지
+    from txt2sql.planner.semantic_executor import _parse_percentile_tail
+
+    if _parse_percentile_tail(q) is not None:
+        contract_extra = contract_extra.model_copy(
+            update={"percentile_requests": []}
+        )
     seen_percentiles: set[tuple[str | None, float]] = set()
     for req in contract_extra.percentile_requests:
         key = (req.field, round(float(req.percentile), 6))
@@ -1230,6 +1778,63 @@ def try_heuristic_plan(
             )
         )
         select = []
+    # 법정동별 용도 비율 상위 N (group + ratio + ORDER BY ratio)
+    if (
+        "법정동" in q
+        and "비율" in q
+        and any(k in q for k in ("가장 높", "제일 높", "상위", "높은"))
+        and entity == "building"
+    ):
+        query_kind = "aggregate"
+        group_by = ["legal_dong"]
+        if not ratios:
+            usage_val = None
+            for u in ("공동주택", "단독주택", "공장", "판매시설"):
+                if u in q:
+                    usage_val = u
+                    break
+            if usage_val:
+                ratios = [
+                    RatioSpec(
+                        numerator_predicate=PredicateSpec(
+                            op="cmp",
+                            left=OperandSpec(kind="field", field="usage"),
+                            operator="eq",
+                            right=OperandSpec(kind="literal", value=usage_val),
+                        ),
+                        denominator_predicate=None,
+                        multiplier=1.0,
+                        alias="apt_ratio" if usage_val == "공동주택" else "ratio_pct",
+                    )
+                ]
+        if ratios and not any(k in q for k in ("%", "백분율", "퍼센트", "프로")):
+            ratios = [item.model_copy(update={"multiplier": 1.0}) for item in ratios]
+        if ratios and "공동주택" in q:
+            ratios = [
+                item.model_copy(update={"alias": "apt_ratio"}) for item in ratios
+            ]
+        order_field = ratios[0].alias if ratios else "n"
+        order_by = [OrderSpec(field=order_field, direction="desc", nulls="last")]
+        if limit is None:
+            limit = _extract_limit(q) or 5
+        if "d198_ledger" not in assumptions:
+            assumptions.append("d198_ledger")
+        # 비율 분자 용도는 WHERE에서 제거 (FILTER로만); 건수 동반
+        if ratios:
+            ratio_fields: set[str] = set()
+            for item in ratios:
+                ratio_fields.update(_pred_field_names(item.numerator_predicate))
+            filters = [item for item in filters if item.field not in ratio_fields]
+            if not any((a.function or "").lower() == "count" for a in aggregations):
+                aggregations = [
+                    AggregationSpec(
+                        function="count",
+                        field=None,
+                        alias="apt_n",
+                        predicate=ratios[0].numerator_predicate,
+                    ),
+                    AggregationSpec(function="count", field=None, alias="n"),
+                ]
     if "지하층" in q and "합계" in q:
         query_kind = "aggregate"
         basement_pred = PredicateSpec(
@@ -1253,6 +1858,28 @@ def try_heuristic_plan(
         order_by = [OrderSpec(field=alias, direction="desc", nulls="last")]
         if limit is None:
             limit = _extract_limit(q)
+    elif group_by and aggregations and not order_by:
+        # 그룹 평균·합계는 지표 내림차순이 기본(골드·가독성)
+        metric_agg = next(
+            (
+                item
+                for item in aggregations
+                if item.function in {"avg", "sum", "max", "min"} and item.alias
+            ),
+            None,
+        )
+        count_agg = next(
+            (item for item in aggregations if item.function == "count" and item.alias),
+            None,
+        )
+        if metric_agg is not None:
+            order_by = [
+                OrderSpec(field=metric_agg.alias, direction="desc", nulls="last")
+            ]
+        elif count_agg is not None:
+            order_by = [
+                OrderSpec(field=count_agg.alias, direction="desc", nulls="last")
+            ]
     if dual_subset_usage:
         query_kind = "aggregate"
         aggregations = [
@@ -1268,50 +1895,85 @@ def try_heuristic_plan(
         ]
         select = []
         limit = None
-    d198_needed = any(
-        item.field in {"detail_usage", "usage_class", "ledger_kind", "permit_date"} for item in filters
-    ) or (
-        predicate is not None
-        and _predicate_has_field(predicate, {"detail_usage", "usage_class"})
-    ) or any(
-        a.startswith("permit_day_gap_")
-        or a.startswith("permit_year_gap:")
-        or a in {"permit_after_approval", "permit_approval_year_neq"}
-        for a in assumptions
-    ) or any(
-        k in q
-        for k in (
-            "주요용도",
-            "세부용도",
-            "용도분류",
-            "허가일",
-            "허가일자",
-            "문교사회용",
-            "표제부",
-            "집합건축물",
-            "일반건축물대장",
-            "용도별건물",
+    elif dual_usage_class_aggs:
+        query_kind = "aggregate"
+        aggregations = dual_usage_class_aggs
+        select = []
+        group_by = []
+        order_by = []
+        limit = None
+        if "d198_ledger" not in assumptions:
+            assumptions.append("d198_ledger")
+    from txt2sql.dataset_grain import grain_to_assumption, resolve_dataset_grain
+    from txt2sql.query_ir.adapters import contract_to_query_ir
+
+    # Central grain policy (coverage-aware usage → D198).
+    try:
+        ir_for_grain = contract_to_query_ir(extract_contract(q))
+        if resolve_dataset_grain(ir_for_grain, q) == "d198":
+            assumptions.append(grain_to_assumption("d198"))
+    except Exception:
+        d198_needed = any(
+            item.field
+            in {
+                "detail_usage",
+                "usage_class",
+                "ledger_kind",
+                "complex_building_kind",
+                "permit_date",
+            }
+            for item in filters
+        ) or (
+            predicate is not None
+            and _predicate_has_field(
+                predicate,
+                {
+                    "detail_usage",
+                    "usage_class",
+                    "ledger_kind",
+                    "complex_building_kind",
+                },
+            )
+        ) or assumptions_include_permit_lag(assumptions) or any(
+            k in q
+            for k in (
+                "세부용도",
+                "용도분류",
+                "허가일",
+                "허가일자",
+                "문교사회용",
+                "표제부",
+                "집합건축물",
+                "일반건축물대장",
+                "용도별건물",
+            )
         )
-    )
-    # cat4 용도×장소 평균·건수: D198 커버 구/동이면 ledger 강제
-    usage_or_detail = any(
-        item.field in {"usage", "detail_usage"} for item in filters
-    ) or (
-        predicate is not None
-        and _predicate_has_field(predicate, {"usage", "detail_usage"})
-    )
-    if not d198_needed and usage_or_detail:
-        gu_hint = extract_gu(q)
-        dong_hint = hints.get("place") if hints.get("place_kind") == "legal_dong" else None
-        if gu_hint is None and dong_hint:
-            gu_hint = d198_gu_for_dong(str(dong_hint), question=q)
-        if gu_hint and d198_table_for_gu(str(gu_hint)) is not None:
-            if query_kind in {"aggregate", "count"} or any(
-                k in q for k in ("평균", "합계", "몇 채", "몇채", "건수", "채수")
-            ):
-                d198_needed = True
-    if d198_needed:
-        assumptions.append("d198_ledger")
+        if d198_needed and "d198_ledger" not in assumptions:
+            assumptions.append("d198_ledger")
+
+    # Pure site_area aggregates (no ledger attributes) stay on D010 GIS grain.
+    site_only = any(
+        a.field == "site_area_m2" for a in aggregations if a.field
+    ) and not any(
+        f.field
+        in {
+            "usage",
+            "detail_usage",
+            "usage_class",
+            "ledger_kind",
+            "complex_building_kind",
+            "permit_date",
+            "approval_date",
+            "building_age_years",
+        }
+        for f in filters
+    ) and not any(k in q for k in ("세부용도", "용도분류", "허가", "사용승인", "건축연령"))
+    if site_only and "대지면적" in q:
+        assumptions = [a for a in assumptions if a != "d198_ledger"]
+        if "d010_gis" not in assumptions:
+            assumptions.append("d010_gis")
+
+    d198_needed = "d198_ledger" in assumptions
     clarify = False
     ambiguities: list[str] = []
     if d198_needed:
@@ -1321,10 +1983,30 @@ def try_heuristic_plan(
             dong_name = hints.get("place")
             if gu_name is None and dong_name:
                 gu_name = d198_gu_for_dong(str(dong_name), question=q)
-        if gu_name is None or d198_table_for_gu(str(gu_name)) is None:
-            clarify = True
-            ambiguities.append(d198_unavailable_reason("세부용도·용도분류"))
-        else:
+        # Main-usage + coverage may set d198 without exclusive fields — skip
+        # clarify when coverage exists for place.
+        from txt2sql.dataset_grain import place_has_d198_coverage
+
+        if not place_has_d198_coverage(q, gu=gu_name, place=dong_name):
+            # Exclusive ledger features without coverage → clarify
+            exclusive = any(
+                item.field
+                in {
+                    "detail_usage",
+                    "usage_class",
+                    "ledger_kind",
+                    "complex_building_kind",
+                    "permit_date",
+                }
+                for item in filters
+            ) or any(
+                k in q
+                for k in ("세부용도", "용도분류", "허가일", "허가일자", "표제부", "집합건축물")
+            )
+            if exclusive:
+                clarify = True
+                ambiguities.append(d198_unavailable_reason("세부용도·용도분류"))
+        elif gu_name:
             scope = ScopeSpec(
                 place=PlaceSpec(name=str(gu_name), kind="gu"),
                 spatial_mode="auto",
@@ -1335,6 +2017,22 @@ def try_heuristic_plan(
                         field="legal_dong", operator="contains", value=dong_name
                     )
                 )
+
+    # top-N rows then outer aggregate → stages CTE (flat limit+agg cannot express this).
+    stages = _maybe_topn_aggregate_stages(
+        q,
+        query_kind=query_kind,
+        limit=limit,
+        order_by=order_by,
+        aggregations=aggregations,
+        select=select,
+    )
+    if stages:
+        query_kind = "aggregate"
+        aggregations = list(stages[1].aggregations)
+        order_by = []
+        limit = None
+        select = []
 
     plan = SemanticQueryPlan(
         query_kind=query_kind,
@@ -1349,6 +2047,8 @@ def try_heuristic_plan(
         order_by=order_by,
         limit=limit,
         spatial_relations=spatial_relations,
+        bins=bins,
+        stages=stages,
         requires_clarification=clarify,
         ambiguities=ambiguities,
         model_confidence=0.7,
@@ -1397,6 +2097,14 @@ def _defer_uses_heuristic(question: str, plan: SemanticQueryPlan) -> bool:
     return True
 
 
+def _heuristic_passes_contract(question: str, plan: SemanticQueryPlan, contract) -> bool:
+    """Weak short-circuits must still pass the same hard contract gate."""
+    from txt2sql.semantic_plan.contract_verifier import verify_contract
+
+    verified = verify_contract(question, plan, contract=contract)
+    return verified.ok and not verified.hard_fail
+
+
 def generate_semantic_plan(
     question: str,
     settings: Settings,
@@ -1427,13 +2135,19 @@ def generate_semantic_plan(
             return heuristic
     if heuristic is not None and accept_heuristic_plan(contract, heuristic):
         return heuristic
-    if heuristic is not None and _boolean_complete(contract, heuristic):
+    # §5.3: boolean / defer / shape presence alone is not completeness evidence.
+    if (
+        heuristic is not None
+        and _boolean_complete(contract, heuristic)
+        and _heuristic_passes_contract(question, heuristic, contract)
+    ):
         return heuristic
     if (
         heuristic is not None
         and not heuristic.requires_clarification
         and heuristic.unsupported_reason is None
         and _defer_uses_heuristic(question, heuristic)
+        and _heuristic_passes_contract(question, heuristic, contract)
     ):
         return heuristic
     if (
@@ -1441,6 +2155,7 @@ def generate_semantic_plan(
         and not heuristic.requires_clarification
         and heuristic.unsupported_reason is None
         and (heuristic.aggregations or heuristic.spatial_relations or heuristic.ratios)
+        and _heuristic_passes_contract(question, heuristic, contract)
     ):
         return heuristic
     last_error: Exception | None = None
@@ -1460,7 +2175,11 @@ def generate_semantic_plan(
             last_error = exc
     if heuristic is not None and heuristic.requires_clarification:
         return heuristic
-    if heuristic is not None and _boolean_complete(contract, heuristic):
+    if (
+        heuristic is not None
+        and _boolean_complete(contract, heuristic)
+        and _heuristic_passes_contract(question, heuristic, contract)
+    ):
         return heuristic
     if any(span.kind == "or" for span in contract.boolean_ops):
         pred = effective_predicate(heuristic) if heuristic is not None else None
@@ -1614,6 +2333,52 @@ def _and_pred(
     return PredicateSpec(op="and", args=[existing, extra])
 
 
+def _edge_bin_from_contract(question: str, bound: Any) -> BinSpec | None:
+    """「500미만, 500~2000, 2000초과로 나눠」형 명시 구간 → BinSpec(edges)."""
+    if not any(k in question for k in ("나눠", "나누어", "나눠서", "구간")):
+        # BIN_HINTS에 나눠가 있어도 임계가 2개 이상일 때만 edge bin
+        pass
+    cuts: list[float] = []
+    field: str | None = None
+    for span in list(getattr(bound, "numbers", None) or []) + list(
+        getattr(bound, "ranges", None) or []
+    ):
+        meta = span.meta or {}
+        f = meta.get("field")
+        if not f:
+            continue
+        if field is None:
+            field = str(f)
+        elif str(f) != field:
+            continue
+        if span.kind == "range" or (
+            isinstance(span.value, (tuple, list)) and len(span.value) == 2
+        ):
+            lo = meta.get("low")
+            hi = meta.get("high")
+            if lo is None and isinstance(span.value, (tuple, list)):
+                lo, hi = span.value[0], span.value[1]
+            for v in (lo, hi):
+                if v is not None and float(v) not in cuts:
+                    cuts.append(float(v))
+        elif span.value is not None:
+            v = float(span.value)
+            if v not in cuts:
+                cuts.append(v)
+    cuts = sorted(cuts)
+    if field is None or len(cuts) < 2:
+        return None
+    # 두 절단점 → 미만 / 중간 / 초과 3구간
+    lo, hi = cuts[0], cuts[1]
+    unit = "㎡" if "area" in field else ""
+    labels = [
+        f"{lo:g}{unit} 미만",
+        f"{lo:g}~{hi:g}{unit}",
+        f"{hi:g}{unit} 초과",
+    ]
+    return BinSpec(field=field, edges=[lo, hi], labels=labels)
+
+
 def _filters_to_predicate(items: list[FilterSpec]) -> PredicateSpec | None:
     from txt2sql.semantic_plan.migrate import filter_to_predicate
 
@@ -1675,16 +2440,61 @@ def _build_ratio_specs(question: str, filters: list[FilterSpec]) -> list[RatioSp
             return specs
     if "중" in question:
         left = question[: question.rfind("중")]
+        right = question[question.rfind("중") + 1 :]
         usage_before = extract_usage(left) is not None
+        # 「30년 이상 된 건물 중 10층 이상」→ den=왼쪽 조건, num=왼쪽+오른쪽
+        left_fields = _ratio_side_fields(left)
+        right_fields = _ratio_side_fields(right)
+        # 「공동주택 중 위반」/「20년 미만 중 집합건축물」
+        if "위반" in right:
+            right_fields.add("violation_status")
+        if any(k in right for k in ("집합건축물", "집합건물")):
+            right_fields.add("complex_building_kind")
+        if left_fields or right_fields:
+            all_items = usage_f + violate_f + land_f + numeric_f
+            # ledger / 집합건물 구분은 filters에 이미 있을 수 있음
+            kind_f = [
+                item
+                for item in filters
+                if item.field in {"ledger_kind", "complex_building_kind"}
+            ]
+            all_items = all_items + kind_f
+            den_items = [item for item in all_items if item.field in left_fields]
+            num_items = [
+                item
+                for item in all_items
+                if item.field in left_fields or item.field in right_fields
+            ]
+            # age/approval on left only → include building_age filters
+            if "building_age_years" in left_fields or "approval_date" in left_fields:
+                age_f = [
+                    item
+                    for item in filters
+                    if item.field in {"building_age_years", "approval_date"}
+                ]
+                for item in age_f:
+                    if item not in den_items:
+                        den_items.append(item)
+                    if item not in num_items:
+                        num_items.append(item)
+            den = _filters_to_predicate(den_items)
+            num = _filters_to_predicate(num_items)
+            if num is not None and den is not None and num_items != den_items:
+                return [
+                    RatioSpec(
+                        numerator_predicate=num,
+                        denominator_predicate=den,
+                    )
+                ]
         numeric_before = bool(re.search(r"\d+", left)) and any(
-            k in left for k in ("층", "㎡", "m", "이상", "이하")
+            k in left for k in ("층", "㎡", "m", "이상", "이하", "년")
         )
         if usage_before and not numeric_before:
             den = _filters_to_predicate(usage_f)
-            num = _filters_to_predicate(usage_f + numeric_f)
+            num = _filters_to_predicate(usage_f + numeric_f + violate_f)
         else:
             den = _filters_to_predicate(numeric_f)
-            num = _filters_to_predicate(numeric_f + usage_f)
+            num = _filters_to_predicate(numeric_f + usage_f + violate_f)
         if num is None:
             return []
         return [RatioSpec(numerator_predicate=num, denominator_predicate=den)]
@@ -1692,6 +2502,30 @@ def _build_ratio_specs(question: str, filters: list[FilterSpec]) -> list[RatioSp
     if num is None:
         return []
     return [RatioSpec(numerator_predicate=num)]
+
+
+def _ratio_side_fields(side: str) -> set[str]:
+    """비율 문장의 ‘중’ 앞·뒤에 등장하는 필드 단서."""
+    text = side or ""
+    fields: set[str] = set()
+    if any(k in text for k in ("층", "지상")):
+        fields.add("ground_floors")
+    if any(k in text for k in ("높이", "고도")):
+        fields.add("height_m")
+    if "연면적" in text:
+        fields.add("gross_floor_area_m2")
+    if any(k in text for k in ("건축물면적", "건축면적", "건물면적")):
+        fields.add("building_area_m2")
+    if any(k in text for k in ("년", "준공", "사용승인", "지어", "된 건물", "된건물")):
+        fields.add("approval_date")
+        fields.add("building_age_years")
+    if any(k in text for k in ("집합건축물", "집합건물")):
+        fields.add("complex_building_kind")
+    if "위반" in text:
+        fields.add("violation_status")
+    if extract_usage(text):
+        fields.add("usage")
+    return fields
 
 
 def _usage_eq(value: str) -> PredicateSpec:
@@ -1724,6 +2558,49 @@ def _dual_count_subset_usage(question: str, usages: list[str]) -> str | None:
     return usages[0]
 
 
+def _dual_usage_class_metric_aggs(
+    question: str, usage_classes: list[str]
+) -> list[AggregationSpec] | None:
+    """주거용과 상업용 … 평균 높이 비교 → FILTER AVG per usage_class."""
+    if len(usage_classes) < 2:
+        return None
+    q = question or ""
+    dual_cue = any(k in q for k in ("비교", "차이")) or bool(
+        re.search(
+            r"(주거용|상업용|공업용|문교사회용).{0,6}(과|와).{0,6}"
+            r"(주거용|상업용|공업용|문교사회용)",
+            q,
+        )
+    )
+    if not dual_cue:
+        return None
+    metrics = _agg_metrics(q)
+    if not metrics:
+        return None
+    field = metrics[0]
+    alias_by_class = {
+        ("주거용", "height_m"): "resi_h",
+        ("상업용", "height_m"): "com_h",
+        ("공업용", "height_m"): "ind_h",
+        ("주거용", "gross_floor_area_m2"): "resi_gfa",
+        ("상업용", "gross_floor_area_m2"): "com_gfa",
+    }
+    aggs: list[AggregationSpec] = []
+    for cls in usage_classes[:4]:
+        alias = alias_by_class.get((cls, field), f"avg_{field}_{cls}")
+        aggs.append(
+            AggregationSpec(
+                function="avg",
+                field=field,
+                alias=alias,
+                filter_field="usage_class",
+                filter_operator="eq",
+                filter_value=cls,
+            )
+        )
+    return aggs or None
+
+
 def _structure_contains(value: str) -> PredicateSpec:
     return PredicateSpec(
         op="cmp",
@@ -1736,9 +2613,10 @@ def _structure_contains(value: str) -> PredicateSpec:
 def _agg_metrics(question: str) -> list[str]:
     metrics: list[str] = []
     mapping = (
+        (("건축연령", "건축 연령", "경과년수", "경과 년수"), "building_age_years"),
         (("높이", "고도"), "height_m"),
         (("연면적",), "gross_floor_area_m2"),
-        (("건축면적", "건물면적"), "building_area_m2"),
+        (("건축물면적", "건축면적", "건물면적"), "building_area_m2"),
         (("대지면적",), "site_area_m2"),
         (("지상층", "층수"), "ground_floors"),
         (("건폐율",), "building_coverage_ratio"),
@@ -1747,6 +2625,9 @@ def _agg_metrics(question: str) -> list[str]:
     for keys, field in mapping:
         if any(k in question for k in keys) and field not in metrics:
             metrics.append(field)
+    # 건축연령이 명시되면 높이 등 다른 측정과 섞지 않음
+    if "building_age_years" in metrics:
+        return ["building_age_years"]
     return metrics or [_rank_metric(question)]
 
 
@@ -1761,7 +2642,13 @@ def _extract_field_compare(question: str) -> FilterSpec | None:
     op = payload.get("op") or "gt"
     if not left or not right:
         return None
-    return FilterSpec(field=str(left), operator=str(op), value_field=str(right))
+    scale = payload.get("scale")
+    return FilterSpec(
+        field=str(left),
+        operator=str(op),
+        value_field=str(right),
+        value_scale=float(scale) if scale is not None else None,
+    )
 
 
 def _metric_group_aggregations(
@@ -1920,6 +2807,10 @@ def _guess_kind(question: str) -> str:
         k in question for k in ("최대", "가장", "상위", "제일")
     ):
         return "rank"
+    if any(k in question for k in ("분위수", "분위", "퍼센타일", "분산", "표준편차", "중앙값", "상관", "상관계수")):
+        return "aggregate"
+    if "일수" in question and any(k in question for k in ("중앙값", "표준편차", "평균")):
+        return "aggregate"
     if any(k in question for k in ("비율", "퍼센트", "몇%", "%씩", "몇 프로")):
         return "aggregate"
     contract = extract_contract(question)
@@ -1951,12 +2842,19 @@ def _guess_kind(question: str) -> str:
             "건물 수",
             "레코드 수",
             "채야",
-            "수는",
             "얼마나",
             "되나요",
         )
     ):
         return "count"
+    # 「층수는」「면적은」처럼 속성 서술의 「수는」는 건수 질의가 아님
+    weak_count = any(k in question for k in ("수는", "수가"))
+    list_cues = any(
+        k in question for k in ("찾아", "보여", "목록", "나열", "레코드")
+    )
+    if weak_count and not list_cues:
+        if not re.search(r"(층|면적|높이|용적|건폐|구조).{0,3}수[는가]", question):
+            return "count"
     if re.search(r"레코드\s*수", question):
         return "count"
     if any(k in question for k in ("건폐율", "용적율", "용적률", "지하")) and not any(
@@ -2021,7 +2919,7 @@ def _rank_metric(question: str) -> str:
         return "approval_date"
     if any(k in question for k in ("높이", "고도", "낮은")):
         return "height_m"
-    if "건축면적" in question or "건물면적" in question:
+    if "건축물면적" in question or "건축면적" in question or "건물면적" in question:
         return "building_area_m2"
     if "대지면적" in question:
         return "site_area_m2"
@@ -2036,7 +2934,7 @@ def _list_select(question: str) -> list[str]:
         (("용도",), "usage"),
         (("높이",), "height_m"),
         (("연면적",), "gross_floor_area_m2"),
-        (("건축면적", "건물면적"), "building_area_m2"),
+        (("건축물면적", "건축면적", "건물면적"), "building_area_m2"),
         (("대지면적",), "site_area_m2"),
         (("지상", "층수"), "ground_floors"),
         (("구조",), "structure"),
@@ -2047,6 +2945,143 @@ def _list_select(question: str) -> list[str]:
         if any(k in question for k in keys) and field not in wanted:
             wanted.append(field)
     return wanted
+
+
+def _maybe_topn_aggregate_stages(
+    question: str,
+    *,
+    query_kind: str,
+    limit: int | None,
+    order_by: list[OrderSpec],
+    aggregations: list[AggregationSpec],
+    select: list[str],
+) -> list[StageSpec]:
+    """상위 N 행을 고른 뒤 평균/합계를 내는 패턴만 stages로 표현한다."""
+    q = question or ""
+    if "상위" not in q:
+        return []
+    if any(k in q for k in ("%", "백분위", "퍼센타일", "퍼센트")):
+        return []
+    if not any(k in q for k in ("평균", "합계", "총합")):
+        return []
+    top_m = re.search(r"상위\s*(\d+)\s*(?:개|곳|채|동)?", q)
+    if not top_m:
+        return []
+    # 구별·용도별 상위 N (그룹 랭킹)은 단일 행 집합 재집계가 아님.
+    if any(
+        k in q
+        for k in (
+            "구별",
+            "구·군별",
+            "구군별",
+            "동별",
+            "법정동별",
+            "용도별",
+            "세부용도별",
+            "층별",
+            "구조별",
+            "시군구별",
+        )
+    ):
+        return []
+    # Explicit group_by on the flat plan → group ranking, not top-N then agg.
+    # (caller may pass aggregations already; stages must not steal group queries)
+    if "별" in q and any(k in q for k in ("평균", "합계")) and "상위" in q:
+        # 「…별 … 상위 N」 is almost always group ranking.
+        if not re.search(r"상위\s*\d+\s*(?:개|곳|채).{0,12}(?:의|을|를).{0,8}(?:평균|합계)", q):
+            return []
+    n = max(1, min(int(top_m.group(1)), 1000))
+    if limit is not None:
+        n = max(1, min(int(limit), 1000))
+
+    metric_alias = {
+        "연면적": "gross_floor_area_m2",
+        "건축물면적": "building_area_m2",
+        "건축면적": "building_area_m2",
+        "건물면적": "building_area_m2",
+        "대지면적": "site_area_m2",
+        "높이": "height_m",
+        "고도": "height_m",
+        "지상층": "ground_floors",
+        "층수": "ground_floors",
+    }
+    rank_field = None
+    rank_m = re.search(
+        r"(연면적|건축물면적|건축면적|건물면적|대지면적|높이|고도|지상층|층수)"
+        r"\s*(?:이\s*)?(?:큰\s*)?상위",
+        q,
+    )
+    if rank_m:
+        rank_field = metric_alias[rank_m.group(1)]
+    elif order_by:
+        rank_field = order_by[0].field
+    else:
+        rank_field = _rank_metric(q)
+
+    direction = order_by[0].direction if order_by else "desc"
+    agg_fn = (
+        "sum"
+        if any(k in q for k in ("합계", "총합")) and "평균" not in q
+        else "avg"
+    )
+    agg_field = None
+    agg_m = re.search(
+        r"평균\s*(높이|고도|연면적|건축물면적|건축면적|건물면적|대지면적|지상층|층수)",
+        q,
+    )
+    if agg_m:
+        agg_field = metric_alias[agg_m.group(1)]
+    else:
+        for item in aggregations or []:
+            if (
+                item.function in {"avg", "sum", "min", "max"}
+                and item.field
+                and item.field != rank_field
+            ):
+                agg_fn = item.function
+                agg_field = item.field
+                break
+        if agg_field is None:
+            for item in aggregations or []:
+                if item.function in {"avg", "sum", "min", "max"} and item.field:
+                    agg_fn = item.function
+                    agg_field = item.field
+                    break
+    if agg_field is None:
+        agg_field = rank_field
+
+    sel = list(select) if select else ["name", "legal_dong", "lot_address", rank_field]
+    if rank_field not in sel:
+        sel.append(rank_field)
+    if agg_field not in sel:
+        sel.append(agg_field)
+    _ = query_kind  # used by callers for context; stages apply regardless of kind
+    outer_aggs = [
+        AggregationSpec(
+            function=agg_fn,  # type: ignore[arg-type]
+            field=agg_field,
+            alias=f"{agg_fn}_{agg_field}",
+        )
+    ]
+    # Top-N 후 평균/합계 스칼라는 gold의 n=N 과 맞추기 위해 건수 동반
+    if "평균" in q or "합계" in q or "총합" in q:
+        outer_aggs.append(
+            AggregationSpec(function="count", field=None, alias="n")
+        )
+    return [
+        StageSpec(
+            id="rank0",
+            kind="rank",
+            select=sel,
+            order_by=[OrderSpec(field=rank_field, direction=direction, nulls="last")],
+            limit=n,
+        ),
+        StageSpec(
+            id="agg1",
+            kind="aggregate",
+            aggregations=outer_aggs,
+        ),
+    ]
 
 
 def _extract_limit(question: str) -> int | None:

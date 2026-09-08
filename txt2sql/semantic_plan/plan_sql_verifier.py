@@ -33,12 +33,20 @@ def verify_plan_to_sql(
     wanted_aggs = Counter(item.function.upper() for item in plan.aggregations)
     got_aggs = Counter(str(fn).upper() for fn in (trace.get("aggregations") or []))
     if wanted_aggs and any(got_aggs[fn] < count for fn, count in wanted_aggs.items()):
+        missing = False
         for fn in wanted_aggs:
-            token = "COUNT(" if fn == "COUNT" else f"{fn}("
-            if token not in sql:
-                errors.append("OUTPUT_SHAPE_MISMATCH")
+            if fn == "PERCENTILE":
+                token_ok = "PERCENTILE" in sql or "PERCENTILE_CONT" in sql
+            elif fn == "VARIANCE":
+                token_ok = "VAR_POP(" in sql or "VARIANCE(" in sql or "VAR_SAMP(" in sql
+            elif fn == "COUNT":
+                token_ok = "COUNT(" in sql
+            else:
+                token_ok = f"{fn}(" in sql
+            if not token_ok:
+                missing = True
                 break
-        else:
+        if missing:
             errors.append("OUTPUT_SHAPE_MISMATCH")
     wanted_groups = list(plan.group_by)
     got_groups = list(trace.get("group_fields") or [])

@@ -91,6 +91,35 @@ _DATA_QUERY_HINTS = (
     "%",
 )
 
+# 「인구관련 데이터가 있는가」류 — 주제 키워드 → 메타 검색 동의어
+_TOPIC_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "인구": ("인구", "활동인구", "유동인구"),
+    "유동인구": ("유동인구", "활동인구", "인구"),
+    "활동인구": ("활동인구", "유동인구", "인구"),
+    "시가화": ("시가화", "시가화용지", "urban"),
+    "건물": ("건물", "건축물", "건물통합"),
+    "산업단지": ("산업단지",),
+    "용도": ("용도별건물", "용도"),
+}
+_TOPIC_AVAIL_CUES = (
+    "관련 데이터",
+    "관련데이터",
+    "관련 자료",
+    "관련자료",
+    "데이터가 있",
+    "데이터 있",
+    "자료가 있",
+    "자료 있",
+    "데이터셋이 있",
+    "테이블이 있",
+    "존재하는가",
+    "존재하나",
+    "존재해",
+    "보유하",
+    "가지고 있",
+    "갖고 있",
+)
+
 _TABLE_ALIASES: dict[str, tuple[str, ...]] = {
     "AL_D010_26_20250704": (
         "건물",
@@ -182,7 +211,9 @@ def _named_dataset_question(q: str) -> bool:
         )
     ):
         return True
-    return "_" in q and any(k in q for k in ("정보", "건물", "단지", "구역"))
+    return "_" in q and any(
+        k in q for k in ("정보", "건물", "단지", "구역", "행정동", "용지", "면적")
+    )
 
 
 def _asks_dataset_summary(q: str) -> bool:
@@ -236,7 +267,32 @@ def is_metadata_question(question: str) -> bool:
         return False
     from txt2sql.domain import extract_gu, extract_place, is_busan_wide
 
+    # 산업단지 명칭·목록·면적순위는 실데이터 조회 (카탈로그 메타가 아님)
+    if "산업단지" in q and any(
+        k in q for k in ("이름", "명칭", "목록", "리스트", "면적", "큰 순", "상위")
+    ):
+        if not any(
+            k in q
+            for k in (
+                "자료",
+                "데이터셋",
+                "데이터",
+                "테이블",
+                "스키마",
+                "컬럼",
+                "속성",
+                "필드",
+            )
+        ):
+            return False
+
     if _asks_d198_where(q):
+        return True
+    # 「인구관련 데이터가 있는가?」류 주제 보유 여부
+    if _asks_topic_availability(q):
+        return True
+    # 「연면적과 건축물면적은 같은 필드야?」
+    if re.search(r"같은\s*필드|다른\s*필드|동일\s*(?:컬럼|필드)|필드야\s*\??", q):
         return True
     _schema_meta_keys = (
         "데이터",
@@ -459,6 +515,205 @@ def _asks_catalog_count(q: str) -> bool:
     return False
 
 
+def _asks_topic_availability(q: str) -> bool:
+    """「인구관련 데이터가 있는가」「유동인구 자료 있어?」류."""
+    text = q.strip()
+    if not text:
+        return False
+    if any(k in text for k in _TOPIC_AVAIL_CUES):
+        return bool(_topic_keywords(text)) or "관련" in text
+    if ("데이터" in text or "자료" in text or "데이터셋" in text or "테이블" in text) and any(
+        k in text
+        for k in ("있는가", "있나요", "있어?", "있어", "있을까", "있나", "있니", "있습니까")
+    ):
+        # 전체 카탈로그 개수 질문과 구분
+        if _asks_catalog_count(text):
+            return False
+        return bool(_topic_keywords(text)) or "관련" in text
+    return False
+
+
+def _topic_keywords(q: str) -> list[str]:
+    """주제 검색용 키워드(동의어 포함)."""
+    found: list[str] = []
+    # 「XXX관련」토큰
+    for m in re.finditer(r"([가-힣A-Za-z0-9]{2,16})\s*관련", q):
+        token = m.group(1).strip()
+        if token and token not in {"데이터", "자료", "정보", "테이블"}:
+            found.append(token)
+            found.extend(_TOPIC_SYNONYMS.get(token, ()))
+    for key, syns in sorted(_TOPIC_SYNONYMS.items(), key=lambda x: -len(x[0])):
+        if key in q:
+            found.append(key)
+            found.extend(syns)
+    # 중복 제거, 짧은 일반어 제외
+    out: list[str] = []
+    seen: set[str] = set()
+    for term in found:
+        t = term.strip()
+        if len(t) < 2 or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
+def _answer_topic_availability(conn: psycopg.Connection, question: str) -> MetaAnswer:
+    """메타데이터에서 주제 관련 테이블·컬럼을 찾아 보유 여부를 답한다."""
+    keywords = _topic_keywords(question)
+    if not keywords:
+        # 「관련」만 있고 주제가 불명확하면 카탈로그로 안내
+        return MetaAnswer(
+            intent="meta_topic_availability",
+            answer=(
+                "어떤 주제의 데이터인지 더 구체적으로 알려 주세요. "
+                "예: 「인구관련 데이터가 있는가?」, 「산업단지 자료 있어?」"
+            ),
+            tables=[],
+            rows=[],
+        )
+
+    like_params = [f"%{k}%" for k in keywords]
+    # table display/description OR column display
+    table_clauses = " OR ".join(
+        ["t.display_name ILIKE %s", "COALESCE(t.description,'') ILIKE %s", "t.table_name ILIKE %s"]
+        * len(keywords)
+    )
+    # expand params: for each keyword, 3 likes
+    table_params: list[str] = []
+    for p in like_params:
+        table_params.extend([p, p, p])
+
+    col_clauses = " OR ".join(["c.display_name ILIKE %s", "c.column_name ILIKE %s"] * len(keywords))
+    col_params: list[str] = []
+    for p in like_params:
+        col_params.extend([p, p])
+
+    sql = f"""
+        SELECT DISTINCT
+            t.table_name,
+            t.display_name,
+            t.category,
+            t.description
+        FROM table_metadata t
+        LEFT JOIN column_metadata c
+          ON c.table_name = t.table_name
+        WHERE t.schema_name = 'public'
+          AND t.table_name NOT LIKE 'temp_%%'
+          AND (
+            ({table_clauses})
+            OR ({col_clauses})
+          )
+        ORDER BY t.display_name NULLS LAST, t.table_name
+        LIMIT 20
+    """
+    rows: list[dict[str, Any]] = []
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, table_params + col_params)
+        rows = list(cur.fetchall())
+
+    topic_label = keywords[0]
+    if not rows:
+        return MetaAnswer(
+            intent="meta_topic_availability",
+            answer=(
+                f"현재 메타데이터 기준으로 「{topic_label}」관련 전용 데이터셋은 "
+                "찾지 못했습니다. 「어떤 데이터가 있어?」로 전체 목록을 확인할 수 있습니다."
+            ),
+            tables=[],
+            rows=[],
+        )
+
+    # 샘플 컬럼(인구 등) — 상위 테이블만 한 번에 조회
+    sample_cols: dict[str, list[str]] = {}
+    top_tables = [str(r["table_name"]) for r in rows[:5]]
+    if top_tables:
+        col_disp_clause = " OR ".join(["display_name ILIKE %s"] * len(keywords))
+        col_sql = f"""
+            SELECT table_name, display_name, column_name
+            FROM column_metadata
+            WHERE table_name = ANY(%s)
+              AND display_name IS NOT NULL
+              AND ({col_disp_clause})
+            ORDER BY table_name,
+              CASE
+                WHEN display_name ~ '^[0-9]+대' THEN 0
+                WHEN display_name LIKE '%%활동인구' THEN 1
+                ELSE 2
+              END,
+              length(display_name) ASC
+        """
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(col_sql, [top_tables, *like_params])
+            for c in cur.fetchall():
+                tname = str(c["table_name"])
+                bucket = sample_cols.setdefault(tname, [])
+                if len(bucket) >= 6:
+                    continue
+                bucket.append(str(c["display_name"] or c["column_name"]))
+
+    lines = [f"네, 「{topic_label}」관련 데이터가 있습니다."]
+    tables: list[str] = []
+    for r in rows:
+        tname = str(r["table_name"])
+        tables.append(tname)
+        disp = r.get("display_name") or tname
+        lines.append(f"- 「{disp}」(`{tname}`)")
+        samples = sample_cols.get(tname) or []
+        if samples:
+            lines.append("  예: " + ", ".join(samples[:4]))
+    lines.append(
+        "예: 「금정구 10세 유동인구」, 「부산시 20대 유동인구」처럼 물으시면 조회할 수 있습니다."
+        if any("인구" in k for k in keywords)
+        else "데이터셋 이름을 말씀해 주시면 목록·속성 조회를 이어갈 수 있습니다."
+    )
+    return MetaAnswer(
+        intent="meta_topic_availability",
+        answer="\n".join(lines),
+        tables=tables,
+        rows=rows,
+    )
+
+
+def _answer_field_equivalence(question: str) -> MetaAnswer | None:
+    """「연면적과 건축물면적은 같은 필드야?」류 스키마 비교."""
+    q = question.strip()
+    if not re.search(r"같은\s*필드|다른\s*필드|동일\s*(?:컬럼|필드)|필드야\s*\??", q):
+        return None
+    pairs = (
+        (
+            ("연면적",),
+            ("건축물면적", "건축면적", "건물면적"),
+            "다른 필드다. 연면적=D010 A14(D198 A19), 건축물면적=D010 A12(D198 A18). "
+            "같은 컬럼이 아니며 의미도 다릅니다.",
+        ),
+        (
+            ("연면적",),
+            ("대지면적",),
+            "다른 필드다. 연면적=D010 A14, 대지면적=D010 A15. 데이터 컬럼이 다릅니다.",
+        ),
+        (
+            ("건축물면적", "건축면적", "건물면적"),
+            ("대지면적",),
+            "다른 필드다. 건축물면적=D010 A12, 대지면적=D010 A15. 데이터 컬럼이 다릅니다.",
+        ),
+    )
+    for lefts, rights, answer in pairs:
+        if any(a in q for a in lefts) and any(b in q for b in rights):
+            return MetaAnswer(intent="meta_field", answer=answer, tables=[], rows=[])
+    if "필드" in q:
+        return MetaAnswer(
+            intent="meta_field",
+            answer=(
+                "필드(컬럼) 동등 여부는 데이터셋마다 다릅니다. "
+                "비교할 두 속성 이름(예: 연면적·건축물면적)을 알려 주세요."
+            ),
+            tables=[],
+            rows=[],
+        )
+    return None
+
+
 def answer_metadata_question(
     conn: psycopg.Connection,
     question: str,
@@ -470,12 +725,20 @@ def answer_metadata_question(
 
     q = question.strip()
 
+    field_cmp = _answer_field_equivalence(q)
+    if field_cmp is not None:
+        return field_cmp
+
     if _asks_d198_where(q):
         return _answer_d198_where(conn)
 
     # 0) 사용 가능 데이터셋 개수
     if _asks_catalog_count(q):
         return _answer_catalog_count(conn)
+
+    # 0.2) 주제별 보유 여부 (인구/건물 관련 데이터 있는가)
+    if _asks_topic_availability(q):
+        return _answer_topic_availability(conn, q)
 
     tables = _resolve_tables(conn, q)
     col_names = _extract_column_tokens(q)
@@ -650,7 +913,8 @@ def _extract_column_tokens(q: str) -> list[str]:
 
 def _resolve_tables(conn: psycopg.Connection, q: str) -> list[str]:
     q_lower = q.lower()
-    hit: list[str] = []
+    exact: list[str] = []
+    alias_hit: list[str] = []
 
     # 물리 테이블명 직접
     with conn.cursor() as cur:
@@ -668,10 +932,10 @@ def _resolve_tables(conn: psycopg.Connection, q: str) -> list[str]:
         table_name = row["table_name"]
         display_name = row["display_name"]
         if table_name.lower() in q_lower or table_name in q:
-            hit.append(table_name)
+            exact.append(table_name)
             continue
         if display_name and display_name in q:
-            hit.append(table_name)
+            exact.append(table_name)
             continue
         aliases = _table_aliases(table_name)
         for alias in aliases:
@@ -679,8 +943,11 @@ def _resolve_tables(conn: psycopg.Connection, q: str) -> list[str]:
             if alias in ("건물", "부산 건물", "부산건물") and d198_gu_mentioned(q) is None:
                 continue
             if alias.lower() in q_lower or alias in q:
-                hit.append(table_name)
+                alias_hit.append(table_name)
                 break
+
+    # 표시명/물리명이 질문에 그대로 있으면 alias(행정동 등) 확장을 하지 않음
+    hit = exact if exact else alias_hit
 
     # 일반 '건물' 질의 → 건물 카테고리 전체
     # 단, 특정 데이터셋명(표시명/물리명)이 이미 매칭되면 확장하지 않음

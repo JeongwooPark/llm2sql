@@ -67,7 +67,7 @@ def build_baseline_manifest(
     *,
     result_file: Path | None = None,
     branch: str = "semantic-architecture-v2",
-    product_version: str = "0.3.2",
+    product_version: str = "0.3.3",
 ) -> dict[str, Any]:
     """Build benchmark_manifest.json from frozen baseline result."""
     result_path = result_file or DEFAULT_RESULT_FILE

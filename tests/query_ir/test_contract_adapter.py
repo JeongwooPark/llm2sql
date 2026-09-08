@@ -38,3 +38,29 @@ def test_contract_no_physical_datasets_in_ir() -> None:
     text = str(dumped)
     assert "AL_D010" not in text
     assert "AL_D198" not in text
+
+
+def test_adapter_preserves_threshold_operator() -> None:
+    contract = extract_contract("높이 40m 이하 건물 수")
+    ir = contract_to_query_ir(contract)
+    height = [p for p in ir.predicates if p.field == "height_m"]
+    assert height
+    assert height[0].operator == "lte"
+
+
+def test_adapter_or_not_exclude_preserves_negation() -> None:
+    contract = extract_contract("공장 또는 창고를 제외한 건물 수")
+    ir = contract_to_query_ir(contract)
+    assert any(p.logical_group == "or" and p.negated for p in ir.predicates) or any(
+        p.negated for p in ir.predicates
+    )
+
+
+def test_adapter_extra_place_not_silent() -> None:
+    contract = extract_contract("수영구 광안2동 건물 수")
+    ir = contract_to_query_ir(contract)
+    assert ir.scope is not None
+    if len(contract.places) > 1:
+        assert any(u.code == "EXTRA_PLACE" for u in ir.unresolved) or (
+            ir.provenance.legacy_hints or {}
+        ).get("extra_places")

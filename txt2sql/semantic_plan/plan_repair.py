@@ -151,9 +151,11 @@ def apply_contract_operators(
             )
             query_kind = "aggregate"
     if contract.fixed_bins and not any(
-        item.startswith("width_bucket:") or item == "approval_decade"
+        item.startswith("width_bucket:")
+        or item.startswith("edge_bins:")
+        or item == "approval_decade"
         for item in assumptions
-    ):
+    ) and not any(spec.edges for spec in (plan.bins or [])):
         bin_field = None
         bin_width = None
         for span in contract.numbers:
@@ -228,11 +230,19 @@ def inject_missing_predicates(
 ) -> SemanticQueryPlan:
     """Add threshold / range filters from contract extraction when absent on plan."""
     from txt2sql.semantic_plan.generator import extract_plan_hints
+    from txt2sql.semantic_plan.models import OperandSpec, PredicateSpec
+    from txt2sql.semantic_plan.predicate_utils import has_op
 
     contract = contract or extract_contract(question)
     hints = extract_plan_hints(question)
     existing_fields = {item.field for item in plan.filters}
     existing_fields |= predicate_fields(effective_predicate(plan))
+    # BinSpec으로 이미 구간화된 필드는 threshold 재주입 금지
+    existing_fields |= {
+        str(spec.field)
+        for spec in (plan.bins or [])
+        if spec.field and (spec.edges or spec.width is not None)
+    }
     new_filters: list[FilterSpec] = []
     for item in hints.get("numeric_expressions") or []:
         field = str(item.get("field") or "")
@@ -248,6 +258,21 @@ def inject_missing_predicates(
             )
         )
         existing_fields.add(field)
+    for span in contract.numbers:
+        if span.meta.get("role", "threshold") != "threshold":
+            continue
+        field = span.meta.get("field")
+        if not field or str(field) in existing_fields:
+            continue
+        new_filters.append(
+            FilterSpec(
+                field=str(field),
+                operator=span.meta.get("operator") or "gte",
+                value=span.value,
+                unit=span.meta.get("unit"),
+            )
+        )
+        existing_fields.add(str(field))
     for span in contract.ranges:
         field = span.meta.get("field")
         if not field or str(field) in existing_fields:
@@ -264,13 +289,103 @@ def inject_missing_predicates(
             )
         )
         existing_fields.add(str(field))
-    if not new_filters:
+
+    predicate = plan.predicate
+    filters = list(plan.filters)
+    if new_filters:
+        filters = filters + new_filters
+        predicate = and_predicates([predicate, filters_to_and(new_filters)])
+
+    # Deterministic categorical OR / NOT repair from contract spans.
+    has_or = any(span.kind == "or" for span in contract.boolean_ops)
+    has_not = any(span.kind == "not" for span in contract.boolean_ops)
+    pred = effective_predicate(plan.model_copy(update={"filters": filters, "predicate": predicate}))
+    if has_or and not has_op(pred, "or"):
+        usage_vals: list[str] = []
+        for span in contract.boolean_ops:
+            if span.kind != "or":
+                continue
+            for key in ("left", "right"):
+                tok = str((span.meta or {}).get(key) or "").strip()
+                if tok:
+                    usage_vals.append(tok)
+        for m in contract.metrics:
+            if m.value == "usage" and m.text not in {"용도"}:
+                usage_vals.append(str(m.meta.get("canonical") or m.text))
+        usage_vals = list(dict.fromkeys(usage_vals))
+        if len(usage_vals) >= 2:
+            children = [
+                PredicateSpec(
+                    op="cmp",
+                    operator="eq",
+                    left=OperandSpec(kind="field", field="usage"),
+                    right=OperandSpec(kind="literal", value=val),
+                )
+                for val in usage_vals[:4]
+            ]
+            or_pred = PredicateSpec(op="or", args=children)
+            # Do NOT also flatten OR values into AND filters (contradicts OR).
+            filters = [
+                f
+                for f in filters
+                if not (f.field == "usage" and f.operator == "eq" and f.value in usage_vals)
+            ]
+            predicate = and_predicates([predicate, or_pred])
+            pred = or_pred
+    if has_not and not (
+        has_op(pred, "not") or any(item.operator == "neq" for item in filters)
+    ):
+        not_span = next(span for span in contract.boolean_ops if span.kind == "not")
+        operands = list((not_span.meta or {}).get("operands") or [])
+        if (not_span.meta or {}).get("scopes_or") and has_op(pred, "or"):
+            # Wrap only the OR subtree, not the entire AND plan.
+            predicate = PredicateSpec(op="not", args=[pred])
+            # Drop flat usage eq filters that duplicate OR children.
+            filters = [f for f in filters if f.field != "usage"]
+        elif len(operands) >= 2:
+            # NOT(A OR B) when OR was not yet built: build OR then negate once.
+            children = [
+                PredicateSpec(
+                    op="cmp",
+                    operator="eq",
+                    left=OperandSpec(kind="field", field="usage"),
+                    right=OperandSpec(kind="literal", value=val),
+                )
+                for val in operands[:4]
+            ]
+            or_pred = PredicateSpec(op="or", args=children)
+            filters = [
+                f
+                for f in filters
+                if not (f.field == "usage" and f.value in operands)
+            ]
+            predicate = and_predicates(
+                [predicate, PredicateSpec(op="not", args=[or_pred])]
+            )
+        elif operands:
+            val = operands[0]
+            # Single exclusion: one neq leaf (no duplicate not(eq)).
+            filters = [
+                f
+                for f in filters
+                if not (f.field == "usage" and f.operator == "eq" and f.value == val)
+            ]
+            filters.append(FilterSpec(field="usage", operator="neq", value=val))
+            predicate = and_predicates(
+                [
+                    predicate,
+                    PredicateSpec(
+                        op="cmp",
+                        operator="neq",
+                        left=OperandSpec(kind="field", field="usage"),
+                        right=OperandSpec(kind="literal", value=val),
+                    ),
+                ]
+            )
+
+    if filters == list(plan.filters) and predicate is plan.predicate:
         return plan
-    filters = list(plan.filters) + new_filters
-    merged_pred = and_predicates(
-        [plan.predicate, filters_to_and(new_filters)]
-    )
-    return plan.model_copy(update={"filters": filters, "predicate": merged_pred})
+    return plan.model_copy(update={"filters": filters, "predicate": predicate})
 
 
 def align_plan_kind(
@@ -324,7 +439,10 @@ def repair_plan_from_contract(
     if codes & {
         "PREDICATE_DROPPED",
         "RANGE_BOUND_DROPPED",
+        "BOOLEAN_OR_DROPPED",
+        "BOOLEAN_NOT_DROPPED",
         "P03",
+        "P04",
         "missing_predicate",
     }:
         repaired = inject_missing_predicates(repaired, question, contract=contract)

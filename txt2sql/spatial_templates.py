@@ -68,6 +68,8 @@ def _prefix_a_cols(frag: str, alias: str) -> str:
 def building_scope(
     place: str | None,
     gu: str | None,
+    *,
+    question: str = "",
 ) -> tuple[str, str, str, str]:
     """건물 질의 범위. (kind, FROM, WHERE, 컬럼접두어).
 
@@ -75,7 +77,7 @@ def building_scope(
     """
     from txt2sql.gazetteer import is_legal_dong, is_locality, uses_admin_boundary
 
-    if place and uses_admin_boundary(place):
+    if place and uses_admin_boundary(place, question=question):
         frm = (
             f'"{_d010()}" b\n'
             f'JOIN "{_BND}" d\n'
@@ -103,9 +105,11 @@ def scoped_count_sql(
     place: str | None,
     gu: str | None,
     extra: list[str] | None = None,
+    *,
+    question: str = "",
 ) -> tuple[str, str]:
     """(kind, COUNT SQL)."""
-    kind, frm, where, prefix = building_scope(place, gu)
+    kind, frm, where, prefix = building_scope(place, gu, question=question)
     parts = [where] if where and where != "TRUE" else []
     for item in extra or []:
         parts.append(_prefix_a_cols(item, prefix.rstrip(".")))
@@ -183,7 +187,7 @@ def place_buffer_count_sql(
 ) -> str:
     extra = "\n  AND NOT ST_Intersects(b.geometry, z.geom)" if exterior else ""
     return (
-        "SELECT COUNT(*) AS cnt\n"
+        'SELECT COUNT(DISTINCT b."A1") AS cnt\n'
         f'FROM "{_d010()}" b\n'
         f"CROSS JOIN {_place_buffer_zone(place)}\n"
         "WHERE z.geom IS NOT NULL\n"

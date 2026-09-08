@@ -1,9 +1,9 @@
-# txt2sql Semantic Query Plan (0.3.2)
+# txt2sql Semantic Query Plan (0.3.3)
 
 > 대상: `JeongwooPark/txt2sql` (구 `JeongwooPark/llm2sql`)  
-> 도입 버전: **0.2.2** · 현재 제품: **0.3.2**  
+> 도입 버전: **0.2.2** · 현재 제품: **0.3.3**  
 > Plan 스키마: **v1.1** · 기본값: `SEMANTIC_PLAN_MODE=hybrid` (`shadow`는 생성만, `off`이면 0.2.1과 동일)  
-> 0.3.2: Query Contract 게이트 + contract-driven `plan_repair` — `docs/20260904_txt2sql_v0.3.2.md`
+> 0.3.3: MAIN485 P0–P2 — `docs/20260908_txt2sql_v0.3.3.md`  ·  0.3.2: Query Contract 게이트 + contract-driven `plan_repair` — `docs/20260904_txt2sql_v0.3.2.md`
 
 원안은 Router 미적중 이후 LLM이 물리 SQL을 직접 쓰던 구간에 **Semantic Query Plan(SQP)** 을 끼워, LLM은 canonical JSON만 만들고 SQL은 Python compiler가 확정적으로 생성하게 하는 것이다. 이 문서는 그 원안을 **0.2.2에서 실제로 넣는 MVP**로 줄인 명세다.
 
@@ -36,7 +36,8 @@
        └─ 미적중
             ├─ SEMANTIC_PLAN_MODE=off     → RAG+LLM SQL (0.2.1과 동일)
             ├─ shadow                     → SQP 생성·검증·컴파일만, 결과는 RAG
-            └─ hybrid                     → SQP 실행 (현재 기본). 실패·미지원 → RAG+LLM SQL
+            └─ hybrid                     → SQP 실행 (현재 기본).
+                 계약·검증 실패(부분 계획) → RAG+LLM SQL (SQL 안전 위반·clarify는 제외)
 ```
 
 삽입 위치는 `pipeline._ask_inner()` 의 `라우트 미매칭 → RAG+LLM` 직전이다. `run_rag_sql()` 은 삭제하지 않는다.
@@ -76,7 +77,11 @@ llm2sql/semantic_plan/
   followup.py     add_filter / change_sort / change_limit / add_select
 ```
 
-직전 결과가 `semantic_plan_*` 이거나 직전 SQL이 D010이면, 짧은 후속은 Plan delta로 먼저 병합한다. 그 다음이 기존 `try_subset_followup` 이다. `heuristic_plan` / `plan_followup_delta` assumption은 품질 점수에서 깎지 않는다.
+직전 결과가 `semantic_plan_*` 이거나 직전 SQL이 D010이면, 짧은 후속은 Plan delta로 먼저 병합한다. 그 다음이 기존 `try_subset_followup` 이다. `heuristic_plan` / `plan_followup_delta` assumption과 **허가↔승인 day-gap** (`permit_day_gap_*`, `order_by_day_gap:*` 등, `is_permit_lag_assumption`)은 품질 점수에서 깎지 않는다.
+
+**구조 필터:** 질문에 `철근콘크리트구조`처럼 공식 `…구조`가 있으면 heuristic/compiler가 `structure` **eq**(A11 equality)를 쓴다. 짧은 별칭·`일반목구조`는 contains/ILIKE.
+
+**허가↔승인 시차:** `permit_day_gap_{gte,lte}:days` assumption이 있으면 D198 A33/A34로 컴파일하고, 건축연령(`rel_years`) 필터와 섞지 않는다. 비율 질의는 FILTER에 day 차를 둔다.
 
 ---
 
@@ -85,10 +90,19 @@ llm2sql/semantic_plan/
 **Entity:** `building` (실행). catalog에는 `admin_area`, `basic_zone` 매핑만 준비.
 
 **Scope:** 구·법정동은 D010 `A4 LIKE`. `spatial_mode=boundary` 또는 행정전용 동은 `BND_ADM_DONG_PG` + `ST_Intersects`.
+`PlaceSpec`은 선택적으로 `sido`/`sigungu`/`code`를 담아 동명 해소와 A3 접두 필터에 쓴다.
 
 **거리:** `within_distance` / `outside_distance` → 행정 경계 `ST_Union` + `ST_DWithin(...::geography)`. 같은 장소를 A4로 중복 필터하지 않는다. 역·POI는 clarify.
 
 **Query kind:** `count`, `list`, `rank`, `aggregate`, `distribution`. 휴리스틱이 「평균」「용도별」을 입구에서 고른다.
+
+**P1 표현력 (optional):**
+- `bins`: 임의 `edges` → 상호 배타 `CASE`, 또는 `width` → FLOOR 버킷. 비어 있으면 기존 `width_bucket:` assumption.
+- `stages`: 비어 있으면 단일 SELECT. `rank`→`aggregate`면 `WITH stage_0 AS (…) SELECT AVG… FROM stage_0` (읽기 전용 WITH+SELECT, `SELECT *` 금지).
+- 조건부 비율은 기존 FILTER; stages[0]이 모집단이면 공통 WHERE는 CTE에만 둔다.
+
+**P2 결과 형상:** `infer_plan_result_kind`가 stages→scalar, bins/group_by→group, ratios→ratio로 분류한다.
+답변·`table`·chart는 기존 `AskResult` 필드를 유지한 채 SQP 경로에 붙인다.
 
 **복합질의 위임 (`should_defer_compound_to_plan`)**
 

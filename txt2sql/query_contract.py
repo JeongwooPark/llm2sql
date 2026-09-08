@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from txt2sql.query_understanding.contract import QueryContract
 from txt2sql.semantic_plan.compiler import CompiledSemanticQuery
 from txt2sql.semantic_plan.models import SemanticQueryPlan
@@ -14,28 +16,9 @@ from txt2sql.semantic_plan.predicate_utils import (
 
 def verify_range_bounds(plan: SemanticQueryPlan, sql: str) -> list[str]:
     """Threshold / BETWEEN from plan.filters and predicate tree must appear in SQL."""
-    import re
-
     errors: list[str] = []
     upper = sql.upper()
     seen: set[str] = set()
-
-    def _numeric_in_sql(val: object | None) -> bool:
-        if val is None:
-            return True
-        text = str(val)
-        if text in sql or text in upper:
-            return True
-        try:
-            num = float(text)
-        except (TypeError, ValueError):
-            return False
-        variants = {str(num), str(int(num)) if num == int(num) else str(num)}
-        for variant in variants:
-            if variant in sql:
-                return True
-        pat = re.escape(str(int(num)) if num == int(num) else str(num))
-        return bool(re.search(rf"(?<![.\d]){pat}(?:\.0+)?(?![.\d])", sql))
 
     pred = effective_predicate(plan)
     for node in predicate_atoms(pred):
@@ -48,7 +31,7 @@ def verify_range_bounds(plan: SemanticQueryPlan, sql: str) -> list[str]:
         if op not in {"gt", "gte", "lt", "lte"}:
             continue
         val = node.right.value if node.right else None
-        if not _numeric_in_sql(val) and "RANGE_BOUND_DROPPED" not in seen:
+        if not _range_value_in_sql(val, sql, upper) and "RANGE_BOUND_DROPPED" not in seen:
             errors.append("RANGE_BOUND_DROPPED")
             seen.add("RANGE_BOUND_DROPPED")
 
@@ -61,10 +44,43 @@ def verify_range_bounds(plan: SemanticQueryPlan, sql: str) -> list[str]:
                 errors.append("RANGE_BOUND_DROPPED")
                 seen.add("RANGE_BOUND_DROPPED")
             continue
-        if not _numeric_in_sql(filt.value) and "RANGE_BOUND_DROPPED" not in seen:
+        if (
+            not _range_value_in_sql(filt.value, sql, upper)
+            and "RANGE_BOUND_DROPPED" not in seen
+        ):
             errors.append("RANGE_BOUND_DROPPED")
             seen.add("RANGE_BOUND_DROPPED")
     return errors
+
+
+def _range_value_in_sql(val: object | None, sql: str, upper: str) -> bool:
+    """Literal / rel_years / INTERVAL forms that compile from range filters."""
+    if val is None:
+        return True
+    text = str(val)
+    if text in sql or text in upper:
+        return True
+    if isinstance(val, str) and val.startswith("rel_years:"):
+        try:
+            years = int(val.split(":", 1)[1])
+        except (TypeError, ValueError):
+            return False
+        # Compiler emits: INTERVAL 'N years' (or months) from rel_years:N
+        if re.search(rf"INTERVAL\s+'{years}\s+years?'", sql, flags=re.I):
+            return True
+        if str(years) in sql:
+            return True
+        return False
+    try:
+        num = float(text)
+    except (TypeError, ValueError):
+        return False
+    variants = {str(num), str(int(num)) if num == int(num) else str(num)}
+    for variant in variants:
+        if variant in sql:
+            return True
+    pat = re.escape(str(int(num)) if num == int(num) else str(num))
+    return bool(re.search(rf"(?<![.\d]){pat}(?:\.0+)?(?![.\d])", sql))
 
 
 _SOFT_CONTRACT_ERRORS = frozenset({"RANGE_BOUND_DROPPED", "PREDICATE_DROPPED"})
@@ -93,6 +109,9 @@ def verify_task_output_alignment(plan: SemanticQueryPlan, sql: str) -> list[str]
 
 def contract_is_executable_query(contract: QueryContract) -> bool:
     """집계·목록·건수 등 데이터 조회 계약 — 스키마 메타가 아님."""
+    q = contract.question or ""
+    if re.search(r"같은\s*필드|다른\s*필드|필드야\s*\??", q):
+        return False
     if contract.operation in {
         "list",
         "rank",

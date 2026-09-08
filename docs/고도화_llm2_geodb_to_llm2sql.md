@@ -3,12 +3,12 @@
 | 항목 | 내용 |
 |------|------|
 | 기준 시스템 | `llm2_geodb` (LM2GISDB **v0.1.0**) — 대화형 GIS 해석·오케스트레이션 |
-| 고도화 시스템 | **`txt2sql` v0.3.2** — 자연어→SQL→한국어 답변 + 지도·데이터 관리 + SQP(hybrid) + Query Contract·plan repair |
+| 고도화 시스템 | **`txt2sql` v0.3.3** — 자연어→SQL→한국어 답변 + 지도·데이터 관리 + SQP(hybrid) + Query Contract·plan repair |
 | 비교 범위 | 자연어·SQL·의도·메타데이터·안전·세션·답변·지도·데이터 관리·제품 표면 |
 | 작성 기준일 | 2026-08-25 |
 | 작성 목적 | `llm2_geodb`에서 `txt2sql`로 이어진 **고도화 내용** 문서화 |
 
-> **현재 버전: txt2sql 0.3.2** (`pyproject.toml`, FastAPI `version`, 웹 Head/Bottom 패널 표기와 동일). SQP Plan 스키마는 v1.1이고 `SEMANTIC_PLAN_MODE` 기본값은 `hybrid`다. 0.3.2 상세는 `docs/20260904_txt2sql_v0.3.2.md`, 0.3.0은 `docs/20260825_txt2sql_v0.3.0.md`.
+> **현재 버전: txt2sql 0.3.3** (`pyproject.toml`, FastAPI `version`, 웹 Head/Bottom 패널 표기와 동일). SQP Plan 스키마는 v1.1이고 `SEMANTIC_PLAN_MODE` 기본값은 `hybrid`다. 0.3.3 상세는 `docs/20260908_txt2sql_v0.3.3.md`, 0.3.2는 `docs/20260904_txt2sql_v0.3.2.md`, 0.3.0은 `docs/20260825_txt2sql_v0.3.0.md`.
 
 ---
 
@@ -590,7 +590,7 @@ v0.2.1에서 `llm2_geodb`의 공간데이터 업로드·메타데이터 화면�
 
 ## 17. 버전별 고도화
 
-`txt2sql`이 `llm2_geodb` 이후 쌓아 온 단계이다. **현재 배포 버전은 0.3.2**이고, SQP는 v1.1·기본 `hybrid`다.
+`txt2sql`이 `llm2_geodb` 이후 쌓아 온 단계이다. **현재 배포 버전은 0.3.3**이고, SQP는 v1.1·기본 `hybrid`다.
 
 | 버전 | 요지 |
 |------|------|
@@ -604,7 +604,8 @@ v0.2.1에서 `llm2_geodb`의 공간데이터 업로드·메타데이터 화면�
 | **0.2.2** | Semantic Query Plan MVP (`off`/`shadow`/`hybrid`, 도입 시 기본 `off`). 복합조건 라우터 위임. 행정 경계·동 버퍼·Plan follow-up delta. SQL 오류 `rollback` |
 | **0.2.3** | SQP v1.1 승격. 기본 `hybrid`. verified gold 30/30, linking holdout, live spatial 6/6. 태그 `sqp-v11-ready` |
 | **0.3.0** | 업로드 공간테이블 RAG 검색, 지명 사전 자동 갱신, 단계구분도, 열 많은 레이어 속성 설명, 메타데이터 CSV. GitHub 저장소명 `txt2sql` |
-| **0.3.2** (현재) | Semantic Architecture v2: PlaceScope·grain, Query Contract, plan repair, 골드테스트1/2. `docs/20260904_txt2sql_v0.3.2.md` |
+| **0.3.2** | PlaceScope·Contract·repair. `docs/20260904_txt2sql_v0.3.2.md` |
+| **0.3.3** (현재) | MAIN485 P0–P2 회복 459/485. `docs/20260908_txt2sql_v0.3.3.md` |
 
 `llm2_geodb`는 **v0.1.0**에서 해석·안전 실행·사용자 SQL 지도화·Shapefile ETL을 프로토타입으로 닫고, NL→SQL(L5)을 후속으로 남겼다.
 
@@ -614,7 +615,7 @@ v0.2.1에서 `llm2_geodb`의 공간데이터 업로드·메타데이터 화면�
 
 `llm2_geodb`는 GIS DB에 대한 **질문–(사용자 SQL)–실행–메타데이터 해석–지도** 순환과 **다층 안전·대화 오케스트레이션**을 연구·프로토타입으로 정립했다.
 
-**`txt2sql`**은 그 계층을 전제로 다음을 고도화했다. 0.2.1까지가 L5·제품화의 골격이고, 0.2.3이 Plan SQL을 기본 실행하며, **현재 배포는 0.3.2**이다.
+**`txt2sql`**은 그 계층을 전제로 다음을 고도화했다. 0.2.1까지가 L5·제품화의 골격이고, 0.2.3이 Plan SQL을 기본 실행하며, **현재 배포는 0.3.3**이다.
 
 1. **L5 완결**: 스키마 RAG + Text-to-SQL + 검증·재시도 실행  
 2. **규칙/하이브리드 라우팅**: 고빈도 LLM 우회 + 9라벨 다스킬 의도. 복합조건은 라우터 미적중으로 두고 SQP에 넘김  
@@ -625,7 +626,7 @@ v0.2.1에서 `llm2_geodb`의 공간데이터 업로드·메타데이터 화면�
 7. **데이터 관리 이식**: Shapefile 업로드·한글 메타데이터를 Head 메뉴로 제품화  
 8. **제품화**: 재사용 엔진, SSE 챗봇, CLI, 벤치·스모크(`smoke_compound30.py`), 공통 사이트 프레임
 
-따라서 `txt2sql` v0.3.2는 `llm2_geodb`의 **대화형 이해·안전 실행·지도·데이터 관리** 성과를 계승하면서, 실무 사용자가 SQL을 직접 쓰지 않아도 되는 **자연어 조회 완결형**으로 발전한 결과물이다. SQP v1.1 기본값은 `hybrid`라 라우터 미적중 복합 질의는 Plan SQL로 닫고, Contract 검증·repair를 거친 뒤 실패 시 RAG로 내려간다. 장애 롤백은 `SEMANTIC_PLAN_MODE=off`다.
+따라서 `txt2sql` v0.3.3는 `llm2_geodb`의 **대화형 이해·안전 실행·지도·데이터 관리** 성과를 계승하면서, 실무 사용자가 SQL을 직접 쓰지 않아도 되는 **자연어 조회 완결형**으로 발전한 결과물이다. SQP v1.1 기본값은 `hybrid`라 라우터 미적중 복합 질의는 Plan SQL로 닫고, Contract 검증·repair를 거친 뒤 실패 시 RAG로 내려간다. 장애 롤백은 `SEMANTIC_PLAN_MODE=off`다.
 
 ---
 
@@ -633,8 +634,8 @@ v0.2.1에서 `llm2_geodb`의 공간데이터 업로드·메타데이터 화면�
 
 - 기준: `D:\py_workspace\llm2_geodb\docs\RND_대화형GIS해석_알고리즘_연구결과보고서.md`
 - 고도화 알고리즘: `D:\py_workspace\llm2sql\docs\RND_자연어GIS질의_알고리즘_연구결과보고서.md`
-- 제품 README: `README.md` (버전 **0.3.2**, SQP v1.1 기본 `hybrid`)
-- 0.3.2 변경: `docs/20260904_txt2sql_v0.3.2.md`
+- 제품 README: `README.md` (버전 **0.3.3**, SQP v1.1 기본 `hybrid`)
+- 0.3.3 변경: `docs/20260908_txt2sql_v0.3.3.md`
 - 0.3.0 변경: `docs/20260825_txt2sql_v0.3.0.md`
 - Semantic Query Plan: `D:\py_workspace\llm2sql\docs\Semantic_Query_Plan_구현.md`
 - 본 문서: `D:\py_workspace\llm2sql\docs\고도화_llm2_geodb_to_txt2sql.md`

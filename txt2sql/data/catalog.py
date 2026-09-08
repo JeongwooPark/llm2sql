@@ -6,7 +6,7 @@ from typing import Any
 
 from psycopg import sql
 
-from txt2sql.config import Settings
+from txt2sql.config import Settings, database_url_for
 from txt2sql.data.names import (
     create_column_description,
     extract_display_name_and_unit,
@@ -24,7 +24,7 @@ def list_spatial_tables(settings: Settings) -> list[dict[str, str]]:
     if not is_safe_ident(schema):
         return []
     try:
-        with connect(settings.database_url) as conn:
+        with connect(database_url_for(settings, "admin")) as conn:
             with conn.cursor() as cur:
                 try:
                     cur.execute(
@@ -82,7 +82,7 @@ def list_spatial_tables(settings: Settings) -> list[dict[str, str]]:
 
 def get_table_structure(settings: Settings, table_name: str) -> list[dict[str, Any]]:
     schema, table = split_schema_table(table_name, settings.map_schema or "public")
-    with connect(settings.database_url) as conn:
+    with connect(database_url_for(settings, "admin")) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -118,7 +118,7 @@ def get_table_structure(settings: Settings, table_name: str) -> list[dict[str, A
 
 def get_database_comments(settings: Settings, table_name: str) -> dict[str, Any]:
     schema, table = split_schema_table(table_name, settings.map_schema or "public")
-    with connect(settings.database_url) as conn:
+    with connect(database_url_for(settings, "admin")) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -161,7 +161,7 @@ def get_table_metadata(settings: Settings, table_name: str) -> dict[str, Any]:
     schema, table = split_schema_table(table_name, settings.map_schema or "public")
     result: dict[str, Any] = {"table_metadata": None, "column_metadata": {}}
     try:
-        with connect(settings.database_url) as conn:
+        with connect(database_url_for(settings, "admin")) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -205,7 +205,7 @@ def get_table_metadata(settings: Settings, table_name: str) -> dict[str, Any]:
 def get_table_display_name(settings: Settings, table_name: str) -> str:
     schema, table = split_schema_table(table_name, settings.map_schema or "public")
     try:
-        with connect(settings.database_url) as conn:
+        with connect(database_url_for(settings, "admin")) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -230,7 +230,7 @@ def update_table_metadata(
     column_metadata: dict[str, Any],
 ) -> None:
     schema, table = split_schema_table(table_name, settings.map_schema or "public")
-    with connect(settings.database_url) as conn:
+    with connect(database_url_for(settings, "admin")) as conn:
         with conn.cursor() as cur:
             _ensure_metadata_tables(cur)
             cur.execute(
@@ -315,7 +315,7 @@ def rename_table(settings: Settings, old_name: str, new_name: str) -> str:
     _, new_table = split_schema_table(new_name, schema)
     if old_table == new_table:
         return f"{schema}.{new_table}"
-    with connect(settings.database_url) as conn:
+    with connect(database_url_for(settings, "admin")) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -375,7 +375,7 @@ def parse_table_code(settings: Settings, table_name: str) -> dict[str, Any] | No
     pnu_code = parsed["pnu_code"]
     dataset_name = None
     pnu_name = None
-    with connect(settings.database_url) as conn:
+    with connect(database_url_for(settings, "admin")) as conn:
         with conn.cursor() as cur:
             try:
                 cur.execute(

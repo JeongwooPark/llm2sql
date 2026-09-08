@@ -1,6 +1,6 @@
 # txt2sql
 
-**버전 0.3.2** (SQP Plan v1.1, Query Contract·plan repair, 기본 `SEMANTIC_PLAN_MODE=hybrid`)
+**버전 0.3.3** (MAIN485 P0–P2 회복, SQP Plan v1.1, Query Contract·plan repair, 기본 `SEMANTIC_PLAN_MODE=hybrid`)
 
 부산 GIS(건물·행정구역·기초구역·산업단지) 데이터를 **자연어**로 조회하는 Python 도구입니다.  
 로컬 **Ollama**로 SQL을 생성·보정하고, **PostgreSQL + PostGIS**에서 실행한 뒤 **한국어**로 답변합니다.  
@@ -17,8 +17,9 @@ CLI·라이브러리 엔진·**웹 챗봇**·**지도 웹앱**을 제공합니�
 
 | 문서 | 내용 |
 |------|------|
-| `docs/작동방식_및_알고리즘.md` | 0.3.2 파이프라인 시나리오 (SQP v1.1 + contract/repair) |
-| `docs/20260904_txt2sql_v0.3.2.md` | 0.3.2 변경·PlaceScope·골드테스트1/2 |
+| `docs/작동방식_및_알고리즘.md` | 0.3.3 파이프라인 시나리오 (SQP v1.1 + contract/repair) |
+| `docs/20260908_txt2sql_v0.3.3.md` | 0.3.3 MAIN485 P0–P2·릴리스 요약 |
+| `docs/20260904_txt2sql_v0.3.2.md` | 0.3.2 PlaceScope·Contract·골드테스트 |
 | `docs/20260825_txt2sql_v0.3.0.md` | 0.3.0 변경·데이터 관리·지도 단계구분도 |
 | `docs/Semantic_Query_Plan_구현.md` | SQP 명세. 기본 `hybrid` |
 | `docs/implementation/sqp_v11_migration.md` | v1.1 hybrid 적용 |
@@ -46,17 +47,18 @@ CLI·라이브러리 엔진·**웹 챗봇**·**지도 웹앱**을 제공합니�
 13. [벤치마크·스크립트](#벤치마크스크립트)
 14. [프로젝트 구조](#프로젝트-구조)
 15. [문제 해결](#문제-해결)
-16. [0.3.2 변경 요약](#032-변경-요약)
-17. [0.3.0 변경 요약](#030-변경-요약)
-18. [0.2.3 변경 요약](#023-변경-요약)
-18. [0.2.2 변경 요약](#022-변경-요약)
-19. [0.2.1 변경 요약](#021-변경-요약)
-20. [0.2 변경 요약](#02-변경-요약)
-21. [0.1.4 변경 요약](#014-변경-요약)
-22. [0.1.3 변경 요약](#013-변경-요약)
-23. [0.1.2 변경 요약](#012-변경-요약)
-24. [0.1.1 변경 요약](#011-변경-요약)
-25. [0.1.0 변경 요약](#010-변경-요약)
+16. [0.3.3 변경 요약](#033-변경-요약)
+17. [0.3.2 변경 요약](#032-변경-요약)
+18. [0.3.0 변경 요약](#030-변경-요약)
+19. [0.2.3 변경 요약](#023-변경-요약)
+20. [0.2.2 변경 요약](#022-변경-요약)
+21. [0.2.1 변경 요약](#021-변경-요약)
+22. [0.2 변경 요약](#02-변경-요약)
+23. [0.1.4 변경 요약](#014-변경-요약)
+24. [0.1.3 변경 요약](#013-변경-요약)
+25. [0.1.2 변경 요약](#012-변경-요약)
+26. [0.1.1 변경 요약](#011-변경-요약)
+27. [0.1.0 변경 요약](#010-변경-요약)
 
 ---
 
@@ -154,8 +156,28 @@ uv run python scripts/refresh_schema_catalog.py   # 스키마 임베딩 갱신 �
 | `SEMANTIC_PLAN_DEBUG` | `plan_quality` 등 디버그 필드 | `false` |
 | `OLLAMA_PLAN_MODEL` | SQP planner 모델. 비우면 `OLLAMA_MODEL` | (없음) |
 | `OLLAMA_PLAN_DIGEST` | 공식 벤치용 planner digest pin | (없음) |
+| `SECURITY_MODE` | `local`(루프백만) / `token`(Bearer+역할 DB) | `local` |
+| `API_USER_TOKEN` | token 모드 사용자 Bearer | (없음) |
+| `API_ADMIN_TOKEN` | token 모드 관리자 Bearer (user와 달라야 함) | (없음) |
+| `TRUSTED_HOSTS` | token 모드 허용 Host | `127.0.0.1,localhost` |
+| `ALLOWED_ORIGINS` | 상태변경 요청 Origin allowlist | (없음) |
+| `TRUST_PROXY_HEADERS` | `X-Forwarded-*` 신뢰 여부 | `false` |
+| `DATABASE_URL_QUERY` | 채팅 SELECT 전용 DB URL | `DATABASE_URL` |
+| `DATABASE_URL_MAP` | 지도 `temp_*` 발행용 DB URL | `DATABASE_URL` |
+| `DATABASE_URL_ADMIN` | 데이터 관리용 DB URL | `DATABASE_URL` |
+| `SESSION_TTL_SECONDS` | 대화 세션 TTL | `3600` |
+| `SESSION_MAX_COUNT` | 동시 세션 상한 | `200` |
+| `MAX_QUESTION_CHARS` | 질문 길이 상한 | `4000` |
+| `MAX_CONCURRENT_ASKS` | 동시 질의 상한 | `4` |
+| `UPLOAD_ZIP_MAX_BYTES` | Shapefile ZIP 압축 크기 상한 | `50MiB` |
+| `ALLOW_REMOTE_OLLAMA_SAMPLES` | 비루프백 Ollama에 샘플값 전송 허용 | `false` |
 
 자격 증명은 `.env`만 사용합니다. 저장소에 비밀번호를 커밋하지 마세요.
+
+**배포 모드:** 기본 `local`은 `127.0.0.1`/`::1`만 허용합니다. `0.0.0.0`·LAN·공용
+서버 노출 전에는 `SECURITY_MODE=token`과 서로 다른 `API_*_TOKEN`, 역할별
+`DATABASE_URL_*`를 설정해야 기동됩니다. 로컬 UI는 루프백에서 암묵적 관리자
+권한으로 동작하므로 Bearer 헤더가 없어도 됩니다.
 
 ---
 
@@ -588,6 +610,12 @@ txt2sql/
 
 ---
 
+## 0.3.3 변경 요약
+
+- **MAIN485 P0–P2**: day-gap·구조 exact·list/group 일반화. **459/485 (94.6%)**, vs r3b +46·lost=0
+- **구조/시차/RAG 가드**: `…구조` A11 equality, non_violation AND, ROUND numeric, 「N년 이내」≠ boundary
+- **문서**: 작업지시서 정리, `docs/20260908_txt2sql_v0.3.3.md`
+
 ## 0.3.2 변경 요약
 
 - **Semantic Architecture v2 통합**: PlaceScope(BND/A3/A4), D010·D198 grain, QueryIR completeness
@@ -596,6 +624,7 @@ txt2sql/
 - **Fallback 계층**: RANGE/PREDICATE soft-warning 후 실행, hard error만 `semantic_plan_fallback`
 - **골드테스트 분리**: 테스트1(구질문 `questions_gold_test1.json`)·테스트2(newset500). UTF-8 `--log`
 - **평가**: GT1 53.6% / GT2 66.2% (rediag). 공통 병목 PREDICATE_DROPPED·ENTITY_SELECTION
+- **P012**: 복합 질의·−15 원천 회귀(grain 단일 권한) 수정. MAIN485 `p012_fix_r4` **391/485 (80.6%)**
 - **문서**: `docs/20260904_txt2sql_v0.3.2.md`
 
 ## 0.3.0 변경 요약

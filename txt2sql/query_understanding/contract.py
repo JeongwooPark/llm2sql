@@ -164,12 +164,20 @@ _COUNTISH = (
     "레코드 수",
     "개수만",
     "있는지",
-    "찾아",
+    # 「찾아줘」는 목록 — count 단서로 쓰지 않음
 )
 
 
 def _explicit_count(question: str) -> bool:
     if any(k in question for k in ("중복", "차이", "평균", "비교")):
+        return False
+    # 목록·탐색 의도면 count 아님
+    if any(
+        k in question
+        for k in ("찾아줘", "찾아라", "찾아주세요", "목록", "나열", "보여줘", "레코드를")
+    ) and not any(
+        k in question for k in ("몇 채", "몇채", "건수", "채수", "개수", "몇 개", "몇개")
+    ):
         return False
     if "별" in question and any(
         k in question for k in ("보여", "집계", "나눠", "구분", "각각")
@@ -195,7 +203,12 @@ def extract_contract(question: str, binding: Any | None = None) -> QueryContract
             metrics.append(span)
     metrics.extend(_categorical_metrics(q))
     metrics = dedupe_nested(metrics)
-    if "기초구역" in q:
+    # 「사용승인일이 기록된 … 평균 건축연령」→ 집계 메트릭은 연령, 승인일은 존재 필터
+    if any(m.value == "building_age_years" for m in metrics) and any(
+        k in q for k in ("기록된", "등록된", "있는")
+    ):
+        metrics = [m for m in metrics if m.value != "approval_date"]
+    if "기초구역" in q or "산업단지" in q:
         for span in metrics:
             if span.value == "gross_floor_area_m2":
                 span.value = "area_m2"
@@ -216,7 +229,6 @@ def extract_contract(question: str, binding: Any | None = None) -> QueryContract
     boolean_ops = dedupe_nested(boolean_ops)
 
     ranges = _extract_ranges(q)
-    numbers = _extract_numbers(q, ranges)
     order = _extract_order(q)
     outputs = _extract_outputs(q)
     comparisons = _extract_comparisons(q)
@@ -226,12 +238,13 @@ def extract_contract(question: str, binding: Any | None = None) -> QueryContract
             span.value = ops.GROUP_FIELD_MAP.get(hint, hint)
             groups.append(span)
     groups = dedupe_nested(groups)
-    if "기초구역" in q:
+    limits = _extract_limits(q, places)
+    numbers = _extract_numbers(q, ranges, places=places, limits=limits)
+    if "기초구역" in q or "산업단지" in q:
         for span in numbers + ranges:
             if span.meta.get("field") == "gross_floor_area_m2":
                 span.meta["field"] = "area_m2"
 
-    limits = _extract_limits(q, places)
     percentile_requests = _extract_percentiles(q)
     ratios = _extract_ratios(q)
     derived_metrics = _extract_derived(q)
@@ -297,15 +310,21 @@ def extract_contract(question: str, binding: Any | None = None) -> QueryContract
         item.kind == "or" and not _or_has_two_operands(q, item) for item in boolean_ops
     )
     contract.aggregation_complete = _aggregation_complete(contract)
+    threshold_numbers = [
+        item for item in numbers if item.meta.get("role", "threshold") == "threshold"
+    ]
     contract.all_numeric_expressions_bound = all(
-        item.meta.get("field") or item.kind == "limit" for item in numbers + ranges
-    ) or not (numbers or ranges)
+        item.meta.get("field") for item in threshold_numbers
+    ) or not threshold_numbers
     if ranges:
-        contract.all_numeric_expressions_bound = all(
-            span.meta.get("low") is not None and span.meta.get("high") is not None
+        contract.all_numeric_expressions_bound = contract.all_numeric_expressions_bound and all(
+            span.meta.get("low") is not None
+            and span.meta.get("high") is not None
+            and span.meta.get("field")
             for span in ranges
         )
     _bind_or_operands(q, boolean_ops)
+    _bind_not_operands(q, boolean_ops, metrics)
     contract.all_requested_outputs_bound = _outputs_bound(outputs)
     contract.coverage_ratio = _slot_coverage(contract)
     contract.complexity = complexity_score(
@@ -322,21 +341,59 @@ def extract_contract(question: str, binding: Any | None = None) -> QueryContract
     return contract
 
 
+_FALSE_PLACE_CONDITION_RE = re.compile(
+    r"(?:이상|이하|초과|미만|넘는|작|크|높|낮).{0,2}이면?$|"
+    r".*(?:구조|용도|시설|생활|업무|판매|숙박|공장|창고|주택)이면?$|"
+    r".*(?:구조|용도)이$"
+)
+
+
 def _drop_false_places(question: str, spans: list[Span]) -> list[Span]:
-    """공동주택·시설 안의 '동' 조각은 장소가 아니다."""
+    """공동주택·시설·조건어미·용도 접두를 장소로 오인하지 않는다."""
+    from txt2sql.domain import (
+        DETAIL_USAGE_ALIASES,
+        STRUCTURE_ALIASES,
+        USAGE_ALIASES,
+    )
+
     kept: list[Span] = []
     semantic_phrases = tuple(ops.GROUP_HINTS) + tuple(ops.METRIC_MAP)
+    domain_phrases = (
+        tuple(USAGE_ALIASES)
+        + tuple(DETAIL_USAGE_ALIASES)
+        + tuple(STRUCTURE_ALIASES)
+        + ("철근콘크리트구조", "철골철근콘크리트구조", "제1종근린생활시설", "제2종근린생활시설")
+    )
     for span in spans:
         after = question[span.end : span.end + 3]
-        if after.startswith(("주택", "시설", "차", "력", "원", "사")):
+        if after.startswith(("주택", "시설", "차", "력", "원", "사", "설")):
             continue
         if span.text in {"공동", "동"}:
+            continue
+        if _FALSE_PLACE_CONDITION_RE.match(span.text):
             continue
         if any(
             span.text != phrase
             and span.text in phrase
             and phrase in question
             for phrase in semantic_phrases
+        ):
+            continue
+        # 용도·구조 표현의 접두(업무시⊂업무시설, 제2종근린생활시⊂…시설)
+        # 질문에 완전형이 없어도 도메인 사전 접두면 장소로 보지 않는다.
+        if any(
+            phrase.startswith(span.text) and phrase != span.text and len(span.text) >= 3
+            for phrase in domain_phrases
+        ):
+            continue
+        # 바로 뒤에 시설명 잔여 음절이 이어지면 장소가 아니다.
+        if after.startswith(("설", "장", "택", "축")):
+            continue
+        if any(alias in span.text for alias in STRUCTURE_ALIASES):
+            continue
+        if any(
+            alias in span.text and len(alias) >= 2
+            for alias in ("이상", "이하", "초과", "미만", "구조")
         ):
             continue
         kept.append(span)
@@ -383,7 +440,76 @@ def _extract_ranges(question: str) -> list[Span]:
     return dedupe_nested(found)
 
 
-def _extract_numbers(question: str, ranges: list[Span]) -> list[Span]:
+_THRESHOLD_OP_RE = re.compile(r"^\s*(이상|이하|초과|미만|넘는|보다\s*큰|보다\s*작|보다\s*높|보다\s*낮)")
+_THRESHOLD_OP_MAP = {
+    "이상": "gte",
+    "이하": "lte",
+    "초과": "gt",
+    "미만": "lt",
+    "넘는": "gt",
+    "보다 큰": "gt",
+    "보다 작": "lt",
+    "보다 높": "gt",
+    "보다 낮": "lt",
+}
+_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
+
+
+def _number_role(question: str, span: Span, *, places: list[Span], limits: list[Span]) -> str:
+    """Classify numeric spans before metric binding."""
+    if any(place.start <= span.start and span.end <= place.end for place in places):
+        return "identifier"
+    if any(lim.start <= span.start and span.end <= lim.end for lim in limits):
+        return "limit"
+    before = question[max(0, span.start - 4) : span.start]
+    after = question[span.end : span.end + 8]
+    unit = str(span.meta.get("unit") or "")
+    raw = str(int(span.value)) if float(span.value).is_integer() else str(span.value)
+    if before.endswith("제") and ("종" in after or after.startswith("종")):
+        return "identifier"
+    # 건축 경과년수(20년 넘고) — metric threshold가 아님
+    if after.startswith("년") and not _YEAR_RE.match(raw):
+        return "age"
+    if _YEAR_RE.match(raw) and (
+        after.startswith("년") or "사용승인" in question or "허가" in question
+    ):
+        return "year"
+    if unit in {"m", "미터", "km"} and any(
+        k in question for k in ("이내", "주변", "반경", "버퍼", "근처", "거리")
+    ):
+        return "distance"
+    if after.startswith("%") or after.startswith("백분위") or after.startswith("분위"):
+        return "percentile"
+    if re.search(r"상위\s*$", question[: span.start]) and re.search(
+        r"^\s*(개|곳|채)(?!%)", after
+    ):
+        return "limit"
+    if re.search(r"^\s*(개|곳|채)(?!%)", after) and "상위" in question[: span.start + 1]:
+        return "limit"
+    return "threshold"
+
+
+def _threshold_operator(question: str, span: Span) -> str | None:
+    after = question[span.end : span.end + 12]
+    match = _THRESHOLD_OP_RE.match(after)
+    if not match:
+        return None
+    token = re.sub(r"\s+", " ", match.group(1).strip())
+    for key, op in _THRESHOLD_OP_MAP.items():
+        if token.startswith(key):
+            return op
+    return None
+
+
+def _extract_numbers(
+    question: str,
+    ranges: list[Span],
+    *,
+    places: list[Span] | None = None,
+    limits: list[Span] | None = None,
+) -> list[Span]:
+    places = places or []
+    limits = limits or []
     found: list[Span] = []
     for match in re.finditer(ops.NUMBER_UNIT_PATTERN, question):
         span = Span(
@@ -396,6 +522,14 @@ def _extract_numbers(question: str, ranges: list[Span]) -> list[Span]:
         )
         if any(rng.contains(span) for rng in ranges):
             continue
+        if any(lim.start <= span.start and span.end <= lim.end for lim in limits):
+            continue
+        role = _number_role(question, span, places=places, limits=limits)
+        span.meta["role"] = role
+        if role == "threshold":
+            op = _threshold_operator(question, span)
+            if op:
+                span.meta["operator"] = op
         found.append(span)
     _bind_numbers_greedily(question, found)
     return found
@@ -456,14 +590,22 @@ def _extract_comparisons(question: str) -> list[Span]:
             left = match.groupdict().get("left")
             right = match.groupdict().get("right")
             rel = "lt" if any(k in match.group(0) for k in ("작", "낮")) else "gt"
+            scale_raw = match.groupdict().get("scale")
+            value = {
+                "left": ops.METRIC_MAP.get(left or "", left),
+                "op": rel,
+                "right": ops.METRIC_MAP.get(right or "", right),
+            }
+            if scale_raw:
+                value["scale"] = float(scale_raw)
             found.append(
                 Span(
                     kind="comparison",
                     text=match.group(0),
                     start=match.start(),
                     end=match.end(),
-                    value={"left": ops.METRIC_MAP.get(left or "", left), "op": rel, "right": ops.METRIC_MAP.get(right or "", right)},
-                    meta={"left": left, "right": right, "op": rel},
+                    value=value,
+                    meta={"left": left, "right": right, "op": rel, "scale": scale_raw},
                 )
             )
     return dedupe_nested(found)
@@ -517,6 +659,56 @@ def _bind_or_operands(question: str, boolean_ops: list[Span]) -> None:
         span.value = (left_tok, right_tok)
 
 
+def _bind_not_operands(
+    question: str,
+    boolean_ops: list[Span],
+    metrics: list[Span],
+) -> None:
+    """Attach NOT scope to preceding OR operands or nearest categorical metrics."""
+    categorical = [
+        m
+        for m in metrics
+        if m.value in {"usage", "detail_usage", "structure", "violation_status"}
+        and str(m.text) not in {"용도", "구조", "세부용도"}
+    ]
+    for span in boolean_ops:
+        if span.kind != "not":
+            continue
+        # Prefer OR immediately before 제외/빼고
+        prior_or = None
+        for other in boolean_ops:
+            if other.kind == "or" and other.end <= span.start:
+                if prior_or is None or other.end > prior_or.end:
+                    prior_or = other
+        operands: list[str] = []
+        fields: list[str] = []
+        if prior_or is not None and span.start - prior_or.end <= 12:
+            left = str(prior_or.meta.get("left") or "")
+            right = str(prior_or.meta.get("right") or "")
+            operands = [t for t in (left, right) if t]
+            nearby = [
+                m
+                for m in categorical
+                if m.end <= span.start and m.start >= max(0, prior_or.start - 24)
+            ]
+            fields = [str(m.value) for m in nearby]
+            span.meta["scopes_or"] = True
+        else:
+            nearby = [
+                m
+                for m in categorical
+                if m.end <= span.start and span.start - m.end <= 24
+            ]
+            if nearby:
+                nearest = max(nearby, key=lambda m: m.end)
+                operands = [str(nearest.text)]
+                fields = [str(nearest.value)]
+        span.meta["operands"] = operands
+        span.meta["negated_fields"] = list(dict.fromkeys(fields))
+        if operands:
+            span.value = tuple(operands)
+
+
 def _outputs_bound(outputs: list[Span]) -> bool:
     if not outputs:
         return True
@@ -534,6 +726,10 @@ def _bind_numbers_greedily(question: str, numbers: list[Span]) -> None:
         "평": "gross_floor_area_m2",
     }
     for span in numbers:
+        role = span.meta.get("role", "threshold")
+        if role != "threshold":
+            span.meta["field"] = None
+            continue
         field, metric_span = _nearest_unused_metric(question, span.start, used_spans)
         if not field:
             field = unit_fields.get(str(span.meta.get("unit") or ""))
@@ -544,6 +740,10 @@ def _bind_numbers_greedily(question: str, numbers: list[Span]) -> None:
             elif "지상" in window:
                 field = "ground_floors"
         span.meta["field"] = field
+        if not span.meta.get("operator"):
+            op = _threshold_operator(question, span)
+            if op:
+                span.meta["operator"] = op
         if metric_span is not None:
             used_spans.add(metric_span)
 
@@ -584,7 +784,7 @@ def _aggregation_complete(contract: QueryContract) -> bool:
     if not contract.aggregations:
         return True
     fns = {item.value for item in contract.aggregations}
-    if "avg" in fns or "sum" in fns or "min" in fns or "max" in fns or "median" in fns or "stddev" in fns:
+    if "avg" in fns or "sum" in fns or "min" in fns or "max" in fns or "median" in fns or "stddev" in fns or "variance" in fns:
         return bool(contract.metrics) or bool(contract.groups)
     return True
 
@@ -632,6 +832,20 @@ def _extract_percentiles(question: str) -> list[PercentileRequest]:
         if pct > 1:
             pct = pct / 100.0
         found.append(PercentileRequest(percentile=max(0.0, min(1.0, pct)), field=field))
+    # 「25%, 50%, 75% 분위수」·「25·50·75% 분위」 다중 분위수
+    if any(k in question for k in ("분위수", "분위", "퍼센타일", "percentile")):
+        seen: set[float] = {round(float(item.percentile), 6) for item in found}
+        for match in re.finditer(r"(\d+(?:\.\d+)?)\s*%", question):
+            pct = float(match.group(1))
+            if pct > 100:
+                continue
+            if pct > 1:
+                pct = pct / 100.0
+            key = round(max(0.0, min(1.0, pct)), 6)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(PercentileRequest(percentile=key, field=field))
     return found
 
 
@@ -671,6 +885,38 @@ def _is_grouped_count_question(question: str, group_fields: list[str]) -> bool:
     return False
 
 
+def _metric_field_near(question: str, index: int, metrics: list[Span]) -> str | None:
+    """Pick numeric/metric field closest to an aggregation token (prefer after)."""
+    numeric_fields = {
+        "height_m",
+        "gross_floor_area_m2",
+        "building_area_m2",
+        "site_area_m2",
+        "ground_floors",
+        "basement_floors",
+        "building_coverage_ratio",
+        "floor_area_ratio",
+        "area_m2",
+    }
+    candidates = [
+        m
+        for m in metrics
+        if m.value in numeric_fields
+    ]
+    if not candidates:
+        return None
+    # Prefer metric immediately after the aggregation word (평균 높이).
+    after = [m for m in candidates if m.start >= index]
+    if after:
+        after.sort(key=lambda m: (m.start - index, -len(m.text)))
+        return str(after[0].value)
+    before = [m for m in candidates if m.end <= index]
+    if before:
+        before.sort(key=lambda m: (index - m.end, -len(m.text)))
+        return str(before[0].value)
+    return _nearest_metric(question, index)
+
+
 def _finalize_requests(contract: QueryContract) -> None:
     q = contract.question
     contract.group_fields = [
@@ -681,12 +927,38 @@ def _finalize_requests(contract: QueryContract) -> None:
         fn = str(item.value or "")
         if fn and fn not in seen_fn:
             seen_fn.append(fn)
-            field = contract.metrics[0].value if contract.metrics else None
+            field = _metric_field_near(q, item.end, contract.metrics)
+            if not field and contract.metrics:
+                # Fall back to first numeric metric, not categorical usage.
+                field = next(
+                    (
+                        str(m.value)
+                        for m in contract.metrics
+                        if m.value
+                        and m.value
+                        not in {
+                            "usage",
+                            "detail_usage",
+                            "structure",
+                            "violation_status",
+                            "special_land",
+                        }
+                    ),
+                    None,
+                )
             contract.aggregation_requests.append(
                 AggregationRequest(function=fn, field=str(field) if field else None)
             )
     if contract.wants_count and "count" not in seen_fn:
         contract.aggregation_requests.append(AggregationRequest(function="count"))
+    # 「평균 … 과 건수」처럼 평균이 있어도 명시 건수는 aggregation에 유지
+    if (
+        "count" not in seen_fn
+        and any(k in q for k in ("건수", "채수", "개수", "건물 수", "건물수"))
+        and not any(item.function == "count" for item in contract.aggregation_requests)
+    ):
+        contract.aggregation_requests.append(AggregationRequest(function="count"))
+        seen_fn.append("count")
     if (
         _is_grouped_count_question(q, contract.group_fields)
         and "count" not in seen_fn

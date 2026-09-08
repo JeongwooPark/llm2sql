@@ -93,9 +93,31 @@ def _add(parsed: Parsed, col: str, sql: str, label: str) -> None:
 
 
 def _is_schema_question(q: str) -> bool:
-    if any(k in q for k in ("이상", "이하", "초과", "미만", "몇", "채", "목록")):
+    if any(k in q for k in ("이상", "이하", "초과", "미만", "몇", "채")):
         return False
-    return any(k in q for k in ("컬럼", "칼럼", "스키마", "속성 설명", "의미가"))
+    # 「목록」만으로는 스키마가 아님(건물 목록 등). 컬럼/속성 목록은 아래에서 잡음.
+    if "목록" in q and not any(
+        k in q for k in ("컬럼", "칼럼", "속성", "필드", "스키마")
+    ):
+        return False
+    return any(
+        k in q
+        for k in (
+            "컬럼",
+            "칼럼",
+            "스키마",
+            "속성 설명",
+            "의미가",
+            "속성데이터",
+            "속성 데이터",
+            "필드목록",
+            "필드 목록",
+            "컬럼목록",
+            "컬럼 목록",
+            "칼럼목록",
+            "칼럼 목록",
+        )
+    )
 
 
 def _has_hint(q: str, ds: Dataset) -> bool:
@@ -356,7 +378,12 @@ def is_catalog_question(question: str, ds: Dataset) -> bool:
     if ds.key == "bas":
         return hinted or ("기초구역" in q and _exclusive_hit(q, ds))
     if ds.key == "bnd":
-        return hinted or _exclusive_hit(q, ds) or "행정동" in q
+        if hinted or _exclusive_hit(q, ds):
+            return True
+        # 「…_행정동」업로드 표시명에 붙은 접미는 BND 단서로 쓰지 않음
+        if "행정동" in q and not re.search(r"_행정동", q):
+            return True
+        return False
     return hinted or _exclusive_hit(q, ds)
 
 

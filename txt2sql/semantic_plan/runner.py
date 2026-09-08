@@ -30,6 +30,7 @@ from txt2sql.semantic_plan.validator import validate_semantic_plan
 from txt2sql.session import SessionContext
 from txt2sql.sql_validator import validate_sql_preexec
 
+# Temporal rel_years / optional predicate drift must not block otherwise-valid SP SQL.
 _SOFT_CONTRACT_ERRORS = frozenset({"RANGE_BOUND_DROPPED", "PREDICATE_DROPPED"})
 
 
@@ -134,6 +135,56 @@ def run_semantic_plan(
             semantic_plan=checked.plan,
             quality=checked.score,
         )
+
+    # 「최근 준공 상위 N% … 평균」등 연도/측정 꼬리 집계는 전용 SQL
+    from txt2sql.planner.semantic_executor import (
+        _compile_percentile_tail_sql,
+        _parse_percentile_tail,
+    )
+
+    tail = _parse_percentile_tail(question)
+    if tail is not None and checked.plan.query_kind == "aggregate":
+        pct, rank_field, agg_field, side = tail
+        try:
+            sql = _compile_percentile_tail_sql(
+                question,
+                pct=pct,
+                rank_field=rank_field,
+                agg_field=agg_field,
+                plan=checked.plan,
+                side=side,
+            )
+            assert_readonly_sql(sql)
+            rows = (
+                execute_query(
+                    conn,
+                    sql,
+                    default_limit=settings.default_limit,
+                    statement_timeout_ms=settings.db_statement_timeout_ms,
+                )
+                if execute
+                else []
+            )
+            plan = checked.plan.model_copy(
+                update={
+                    "assumptions": list(checked.plan.assumptions or [])
+                    + ["percentile_tail"]
+                }
+            )
+            answer = format_semantic_answer(
+                question, plan=plan, rows=list(rows or []), row_count=len(rows or [])
+            )
+            return _sqp_ok(
+                route="semantic_plan_aggregate",
+                sql=sql,
+                tables=[],
+                semantic_plan=plan.model_dump(),
+                plan_quality=checked.score,
+                rows=list(rows or []),
+                answer=answer,
+            )
+        except Exception as exc:
+            emit("plan_fallback", f"percentile_tail 실패: {type(exc).__name__}: {exc}")
 
     try:
         plan, compiled, contract_errors = compile_with_contract_gate(

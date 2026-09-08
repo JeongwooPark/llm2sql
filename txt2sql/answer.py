@@ -223,6 +223,55 @@ def _summarize_rows(rows: list[dict[str, Any]], *, limit: int = 5) -> str:
     return "\n".join(lines)
 
 
+def _format_place_boundary_area(
+    question: str,
+    *,
+    rows: list[dict[str, Any]],
+    row_count: int,
+) -> str:
+    """행정·법정동·시·구 경계 면적 답변."""
+    subject = _subject_phrase(question) or "해당 지역"
+    if row_count == 1 and "adm_dong_n" in (rows[0] or {}):
+        area = rows[0].get("area_m2")
+        n = rows[0].get("adm_dong_n")
+        try:
+            area_f = float(area)
+            n_i = int(n)
+        except (TypeError, ValueError):
+            return f"{subject}의 행정구역 면적을 계산하지 못했습니다."
+        return (
+            f"{subject}의 행정구역 면적은 약 {area_f:,.0f}㎡입니다. "
+            f"(행정동 {n_i}개 합산, 행정동 경계 면적 기준)"
+        )
+    lines: list[str] = []
+    total = 0.0
+    for row in rows:
+        name = row.get("ADM_NM") or row.get("adm_nm") or row.get("label")
+        raw = row.get("area_m2")
+        if name is None or raw is None:
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        total += val
+        lines.append(f"{name} {val:,.0f}㎡")
+    if not lines:
+        return f"{subject}의 행정구역 면적 데이터를 찾지 못했습니다."
+    if len(lines) == 1:
+        return (
+            f"{subject}의 행정구역 면적은 약 {lines[0].split(' ', 1)[1]}입니다. "
+            "(행정동 경계 면적 기준)"
+        )
+    body = ", ".join(lines[:12])
+    if len(lines) > 12:
+        body += f" 외 {len(lines) - 12}개 동"
+    return (
+        f"{subject}의 행정구역 면적은 행정동별로 {body}이며, "
+        f"합계 약 {total:,.0f}㎡입니다. (행정동 경계 면적 기준)"
+    )
+
+
 def _subject_phrase(question: str) -> str:
     """질문에서 장소·용도·조건을 모아 주어 구절을 만든다."""
     place = extract_place(question)
@@ -1720,6 +1769,9 @@ def format_success_template(
     if route == "building_map_display" or wants_map_display(question):
         return format_map_display_answer(question, rows=rows, include_map=True)
 
+    if route == "named_dataset_place_area":
+        return _format_place_boundary_area(question, rows=rows, row_count=row_count)
+
     scalar = _scalar_from_rows(rows)
     single_metric = row_count == 1 and scalar is not None and len(rows[0]) <= 2
 
@@ -1870,6 +1922,19 @@ def format_success(
         final = with_coverage_preface(answer, route, question)
         if on_token is not None:
             emit_text_chunks(_prose_without_markdown_table(final), on_token)
+        return final
+
+    if route == "named_dataset_place_area":
+        answer = format_success_template(
+            question,
+            sql=sql,
+            rows=rows,
+            row_count=row_count,
+            route=route,
+        )
+        final = with_coverage_preface(answer, route, question)
+        if on_token is not None:
+            emit_text_chunks(final, on_token)
         return final
 
     if route == "legal_dong_admin_share":

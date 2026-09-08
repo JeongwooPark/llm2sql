@@ -81,6 +81,34 @@ def test_physical_d010_strips_d198_ledger() -> None:
     assert "d010_gis" in (plan.assumptions or [])
 
 
+def test_central_grain_overrides_forced_d010_for_covered_usage() -> None:
+    """Coverage+usage → D198 even if PhysicalPlan wrongly says D010 (P012 −15 root)."""
+    from txt2sql.domain import reset_d198_coverage, set_d198_coverage
+
+    set_d198_coverage({"금정구": "AL_D198_26410_20250115"})
+    try:
+        q = "금정구 단독주택은 몇 채야?"
+        bundle = build_execution_plan(q)
+        forced = PhysicalPlan(
+            strategy="D010_EXECUTOR",
+            logical=bundle.logical,
+            cost=1.0,
+            reasons=("forced_wrong_d010",),
+            covered_ops=bundle.physical.covered_ops,
+            partial=False,
+        )
+        plan = build_sqp(
+            bundle.query_ir,
+            question=q,
+            physical=forced,
+            logical=bundle.logical,
+        )
+        assert "d198_ledger" in (plan.assumptions or [])
+        assert "d010_gis" not in (plan.assumptions or [])
+    finally:
+        reset_d198_coverage()
+
+
 def test_typed_failure_gate_returns_none_path() -> None:
     # meta/list gated — should_try false
     ir = QueryIR(task="meta")

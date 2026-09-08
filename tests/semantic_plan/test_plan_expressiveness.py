@@ -1,9 +1,19 @@
+from txt2sql.db import assert_readonly_sql
+from txt2sql.semantic_plan.compiler import compile_semantic_plan
 from txt2sql.semantic_plan.generator import try_heuristic_plan
 from txt2sql.semantic_plan.models import (
     AggregationSpec,
+    BinSpec,
     ExpressionSpec,
+    FilterSpec,
+    OperandSpec,
     OrderSpec,
+    PlaceSpec,
+    PredicateSpec,
+    RatioSpec,
+    ScopeSpec,
     SemanticQueryPlan,
+    StageSpec,
 )
 from txt2sql.semantic_plan.validator import validate_semantic_plan
 
@@ -104,3 +114,174 @@ def test_validator_rejects_divide_without_denominator() -> None:
     )
     result = validate_semantic_plan(plan, "건축면적 대비")
     assert result.status == "fallback"
+
+
+def test_place_spec_roundtrip_keeps_parent_context() -> None:
+    plan = SemanticQueryPlan(
+        query_kind="count",
+        entity="building",
+        scope=ScopeSpec(
+            place=PlaceSpec(
+                name="연산동",
+                kind="legal_dong",
+                sido="부산광역시",
+                sigungu="연제구",
+                code="26470",
+            )
+        ),
+    )
+    restored = SemanticQueryPlan.model_validate(plan.model_dump())
+    assert restored.scope is not None
+    assert restored.scope.place is not None
+    assert restored.scope.place.sigungu == "연제구"
+    assert restored.scope.place.sido == "부산광역시"
+    assert restored.scope.place.code == "26470"
+
+
+def test_legacy_place_json_deserializes_without_parent_fields() -> None:
+    plan = SemanticQueryPlan.model_validate(
+        {
+            "version": "1.0",
+            "query_kind": "count",
+            "entity": "building",
+            "scope": {
+                "place": {"name": "해운대구", "kind": "gu"},
+                "spatial_mode": "auto",
+            },
+        }
+    )
+    assert plan.scope and plan.scope.place
+    assert plan.scope.place.sido is None
+    assert plan.bins == []
+    assert plan.stages == []
+
+
+def test_bins_edges_compile_to_case() -> None:
+    plan = SemanticQueryPlan(
+        query_kind="aggregate",
+        entity="building",
+        scope=ScopeSpec(place=PlaceSpec(name="금정구", kind="gu")),
+        bins=[
+            BinSpec(
+                field="gross_floor_area_m2",
+                edges=[0, 100, 200],
+                labels=["0_100", "100_200", "200_inf"],
+            )
+        ],
+        group_by=["gross_floor_area_m2"],
+        aggregations=[AggregationSpec(function="count", alias="n")],
+    )
+    compiled = compile_semantic_plan(plan)
+    sql_u = compiled.sql.upper()
+    assert "CASE" in sql_u
+    assert "0_100" in compiled.sql
+    assert_readonly_sql(compiled.sql)
+
+
+def test_empty_stages_matches_flat_sql() -> None:
+    base = SemanticQueryPlan(
+        query_kind="count",
+        entity="building",
+        scope=ScopeSpec(place=PlaceSpec(name="해운대구", kind="gu")),
+        filters=[FilterSpec(field="usage", operator="eq", value="공동주택")],
+    )
+    with_empty = base.model_copy(update={"stages": [], "bins": []})
+    assert compile_semantic_plan(base).sql == compile_semantic_plan(with_empty).sql
+
+
+def test_stages_topn_then_avg_compiles_cte() -> None:
+    plan = SemanticQueryPlan(
+        query_kind="aggregate",
+        entity="building",
+        scope=ScopeSpec(place=PlaceSpec(name="해운대구", kind="gu")),
+        aggregations=[
+            AggregationSpec(function="avg", field="height_m", alias="avg_height_m")
+        ],
+        stages=[
+            StageSpec(
+                id="rank0",
+                kind="rank",
+                select=[
+                    "name",
+                    "legal_dong",
+                    "lot_address",
+                    "gross_floor_area_m2",
+                    "height_m",
+                ],
+                order_by=[
+                    OrderSpec(field="gross_floor_area_m2", direction="desc")
+                ],
+                limit=10,
+            ),
+            StageSpec(
+                id="agg1",
+                kind="aggregate",
+                aggregations=[
+                    AggregationSpec(
+                        function="avg", field="height_m", alias="avg_height_m"
+                    )
+                ],
+            ),
+        ],
+    )
+    compiled = compile_semantic_plan(plan)
+    sql_u = compiled.sql.upper()
+    assert sql_u.startswith("WITH")
+    assert "STAGE_0" in sql_u or '"STAGE_0"' in compiled.sql.upper()
+    assert "LIMIT 10" in sql_u
+    assert "AVG(" in sql_u
+    assert "SELECT *" not in sql_u
+    assert_readonly_sql(compiled.sql)
+
+
+def test_ratio_with_stage0_population_keeps_filter_on_outer() -> None:
+    usage_eq = PredicateSpec(
+        op="cmp",
+        operator="eq",
+        left=OperandSpec(kind="field", field="usage"),
+        right=OperandSpec(kind="literal", value="공동주택"),
+    )
+    plan = SemanticQueryPlan(
+        query_kind="aggregate",
+        entity="building",
+        scope=ScopeSpec(place=PlaceSpec(name="영도구", kind="gu")),
+        filters=[FilterSpec(field="ground_floors", operator="gte", value=15)],
+        ratios=[
+            RatioSpec(
+                numerator_predicate=usage_eq,
+                denominator_predicate=None,
+                alias="ratio_pct",
+            )
+        ],
+        stages=[
+            StageSpec(
+                id="pop0",
+                kind="filter",
+                select=["usage", "ground_floors"],
+            )
+        ],
+    )
+    compiled = compile_semantic_plan(plan)
+    sql_u = compiled.sql.upper()
+    assert sql_u.startswith("WITH")
+    assert "FILTER" in sql_u
+    assert "A26" in compiled.sql or "GROUND_FLOORS" in sql_u
+    assert_readonly_sql(compiled.sql)
+
+
+def test_heuristic_topn_average_emits_stages() -> None:
+    plan = try_heuristic_plan("해운대구 연면적 상위 10개 건물의 평균 높이")
+    assert plan is not None
+    assert plan.stages
+    assert plan.stages[0].kind == "rank"
+    assert plan.stages[0].limit == 10
+    assert plan.stages[1].kind == "aggregate"
+    sql = compile_semantic_plan(plan).sql.upper()
+    assert sql.startswith("WITH")
+
+
+def test_gu_plus_dong_fills_place_sigungu() -> None:
+    plan = try_heuristic_plan("연제구 연산동 건물 수는?")
+    assert plan is not None
+    assert plan.scope and plan.scope.place
+    assert plan.scope.place.sigungu == "연제구" or plan.assumptions

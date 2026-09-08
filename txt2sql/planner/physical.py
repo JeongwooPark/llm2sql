@@ -54,13 +54,26 @@ def _has_d198_strong_slot(ir) -> bool:
     return False
 
 
-def _prefer_d010_for_main_usage(ir) -> bool:
-    """Main usage (A9) without D198-strong slots → D010."""
-    if ir.task not in {"list", "rank", "count"}:
+def _prefer_d010_for_main_usage(ir, *, question: str = "") -> bool:
+    """Main usage without D198 need (no coverage / busan-wide) → D010."""
+    from txt2sql.dataset_grain import query_ir_needs_d198
+
+    if ir.task not in {"list", "rank", "count", "aggregate", "scalar"}:
         return False
     if not any(p.field == "usage" for p in ir.predicates):
-        return False
-    return not _has_d198_strong_slot(ir)
+        # also check nested OR children
+        def _has_usage(preds) -> bool:
+            for p in preds:
+                if getattr(p, "field", None) == "usage":
+                    return True
+                kids = getattr(p, "children", None) or []
+                if kids and _has_usage(kids):
+                    return True
+            return False
+
+        if not _has_usage(ir.predicates or []):
+            return False
+    return not query_ir_needs_d198(ir, question)
 
 
 def _ir_prefers_d198(ir, *, question: str = "") -> bool:
@@ -93,7 +106,7 @@ def select_physical_plan(
     ir = logical.query_ir
     datasets = {b.dataset for b in logical.bindings}
 
-    if _prefer_d010_for_main_usage(ir):
+    if _prefer_d010_for_main_usage(ir, question=question):
         return PhysicalPlan(
             strategy="D010_EXECUTOR",
             logical=logical,
@@ -103,13 +116,25 @@ def select_physical_plan(
             partial=False,
         )
 
-    # D198 binding wins for temporal/detail/permit — not bare main-usage lists.
-    if "building_attr_d198" in datasets and not _prefer_d010_for_main_usage(ir):
+    # D198 binding wins for temporal/detail/permit — and covered main-usage.
+    if "building_attr_d198" in datasets and not _prefer_d010_for_main_usage(
+        ir, question=question
+    ):
         return PhysicalPlan(
             strategy="D198_EXECUTOR",
             logical=logical,
             cost=3.0,
             reasons=("d198_binding",),
+            covered_ops=tuple(ops),
+            partial=False,
+        )
+
+    if _ir_prefers_d198(ir, question=question):
+        return PhysicalPlan(
+            strategy="D198_EXECUTOR",
+            logical=logical,
+            cost=3.0,
+            reasons=("dataset_grain_d198",),
             covered_ops=tuple(ops),
             partial=False,
         )
@@ -168,10 +193,14 @@ def select_physical_plan(
             partial=False,
         )
 
-    # Ledger-oriented slots prefer D198; bare main usage stays on D010.
+    # Ledger-oriented slots prefer D198; bare main usage stays on D010
+    # unless central grain policy (coverage + usage) requires D198.
     if (
         _has_d198_strong_slot(ir)
-        or ("building_attr_d198" in datasets and not _prefer_d010_for_main_usage(ir))
+        or (
+            "building_attr_d198" in datasets
+            and not _prefer_d010_for_main_usage(ir, question=question)
+        )
         or _ir_prefers_d198(ir, question=question)
     ):
         return PhysicalPlan(

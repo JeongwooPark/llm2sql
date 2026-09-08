@@ -348,12 +348,15 @@ def parse_followup_delta(question: str) -> PlanDelta | None:
         k in q
         for k in ("이름", "건물명", "지번", "목록", "보여", "리스트", "가장", "제일")
     )
+    # 「그중 …만」필터는 부모 list/rank를 유지. 개수 전환은 apply_count_display_followup
+    # (COUNT OVER·‘N동입니다’)에서만 수행한다.
     if (
         _subset
         and (add_filters or add_spatial)
         and not _listish
         and change_kind is None
         and change_aggregations is None
+        and any(k in q for k in ("몇", "건수", "채수", "개수", "얼마나"))
     ):
         change_kind = "count"
 
@@ -729,13 +732,7 @@ def apply_count_display_followup(
     spoken = bool(_COUNT_SPOKEN.search(answer))
     dumped = session.last_semantic_plan or {}
     dumped_count = dumped.get("query_kind") == "count"
-    delta = parse_followup_delta(q)
-    filter_only = bool(
-        delta
-        and (delta.add_filters or delta.add_spatial)
-        and delta.change_kind in {None, "count"}
-    )
-    if not (over or spoken or dumped_count or plan.query_kind == "count" or filter_only):
+    if not (over or spoken or dumped_count or plan.query_kind == "count"):
         return plan
     if plan.query_kind == "count" and plan.limit is None:
         return plan

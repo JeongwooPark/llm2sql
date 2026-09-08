@@ -312,6 +312,13 @@ BUILDING_FIELDS: dict[str, SemanticField] = {
         D198_FIELD_COLUMNS["ledger_kind"],
         "대장종류",
     ),
+    "complex_building_kind": _text(
+        "complex_building_kind",
+        "building",
+        BUILDING_TABLE,
+        D198_FIELD_COLUMNS["complex_building_kind"],
+        "집합건물구분",
+    ),
     "geometry": SemanticField(
         key="geometry",
         entity="building",
@@ -348,6 +355,14 @@ INDUSTRIAL_FIELDS: dict[str, SemanticField] = {
     "name": _text("name", "industrial_complex", INDUSTRIAL_TABLE, "A8", "산업단지명"),
     "alt_name": _text("alt_name", "industrial_complex", INDUSTRIAL_TABLE, "A9", "산업단지 별칭"),
     "type": _text("type", "industrial_complex", INDUSTRIAL_TABLE, "A6", "산업단지 유형"),
+    "area_m2": _num(
+        "area_m2",
+        "industrial_complex",
+        INDUSTRIAL_TABLE,
+        "geometry",
+        "산업단지면적",
+        "m2",
+    ),
     "geometry": SemanticField(
         key="geometry",
         entity="industrial_complex",

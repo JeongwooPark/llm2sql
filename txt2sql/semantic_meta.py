@@ -351,6 +351,35 @@ def tables_matching_labels(
     return matched
 
 
+def tables_matching_exact_display_names(
+    question: str,
+    metadata_rows: list[dict[str, str]],
+) -> list[str]:
+    """질문 문자열에 표시명(또는 물리명)이 그대로 포함된 테이블을 최장 일치 순으로 반환."""
+    if not question:
+        return []
+    q_lower = question.lower()
+    hits: list[tuple[int, str]] = []
+    for row in metadata_rows:
+        name = (row.get("table_name") or "").strip()
+        if not name:
+            continue
+        display = (row.get("display_name") or "").strip()
+        score = 0
+        if display and display in question:
+            score = len(display)
+        elif name in question or name.lower() in q_lower:
+            score = len(name)
+        if score:
+            hits.append((score, name))
+    hits.sort(key=lambda item: (-item[0], item[1]))
+    out: list[str] = []
+    for _, name in hits:
+        if name not in out:
+            out.append(name)
+    return out
+
+
 def format_synonyms(syns: tuple[str, ...], *, max_n: int = 6) -> str:
     if not syns:
         return ""

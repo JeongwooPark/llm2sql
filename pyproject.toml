@@ -1,6 +1,6 @@
 [project]
 name = "txt2sql"
-version = "0.3.2"
+version = "0.3.3"
 description = "자연어 질의를 PostgreSQL SQL로 변환해 실행합니다 (Ollama)."
 readme = "README.md"
 requires-python = ">=3.13"

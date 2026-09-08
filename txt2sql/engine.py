@@ -8,7 +8,7 @@ import ollama
 import psycopg
 from psycopg.rows import dict_row
 
-from txt2sql.config import Settings, load_settings
+from txt2sql.config import Settings, database_url_for, load_settings
 from txt2sql.pipeline import run_ask
 from txt2sql.progress import ProgressCallback, TokenCallback
 from txt2sql.session import SessionContext
@@ -84,9 +84,12 @@ class Txt2SqlEngine:
         if self._conn is None or self._conn.closed:
             timeout_ms = int(self.settings.db_statement_timeout_ms)
             self._conn = psycopg.connect(
-                self.settings.database_url,
+                database_url_for(self.settings, "query"),
                 row_factory=dict_row,
-                options=f"-c statement_timeout={timeout_ms}",
+                options=(
+                    f"-c statement_timeout={timeout_ms} "
+                    f"-c default_transaction_read_only=on"
+                ),
             )
             try:
                 from txt2sql.data.coverage import refresh_dataset_coverage

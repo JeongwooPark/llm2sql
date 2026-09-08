@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import unquote
 
 _URL_CRED = re.compile(r"(postgres(?:ql)?://)([^:/@]+):([^@/]+)@", re.IGNORECASE)
 _KV_SECRET = re.compile(
-    r"(password|passwd|pwd|secret|api[_-]?key|database_url)\s*[=:]\s*([^\s,;]+)",
+    r"(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"session[_-]?secret|database_url|authorization)\s*[=:]\s*([^\s,;]+)",
     re.IGNORECASE,
+)
+_BEARER = re.compile(r"(?i)(authorization\s*:\s*bearer\s+)(\S+)")
+_COOKIE = re.compile(r"(?i)((?:set-)?cookie\s*[:=]\s*)([^;\s]+)")
+_QUERY_PASS = re.compile(
+    r"(?i)([?&](?:password|passwd|pwd|token|secret|api_key)=)([^&#\s]+)"
 )
 
 
@@ -26,7 +33,15 @@ def official_benchmark_allowed(plan_model: str, embed_model: str) -> tuple[bool,
 
 
 def mask_text(value: str) -> str:
-    text = _URL_CRED.sub(r"\1\2:***@", value)
+    text = value
+    try:
+        text = unquote(text)
+    except Exception:
+        text = value
+    text = _URL_CRED.sub(r"\1\2:***@", text)
+    text = _BEARER.sub(r"\1***", text)
+    text = _COOKIE.sub(r"\1***", text)
+    text = _QUERY_PASS.sub(r"\1***", text)
     text = _KV_SECRET.sub(lambda match: f"{match.group(1)}=***", text)
     return text
 
@@ -38,14 +53,39 @@ def mask_value(value: Any) -> Any:
         return mask_mapping(value)
     if isinstance(value, list):
         return [mask_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(mask_value(item) for item in value)
+    if isinstance(value, set):
+        return {mask_value(item) for item in value}
+    if isinstance(value, BaseException):
+        return mask_text(f"{type(value).__name__}: {value}")
     return value
 
 
 def mask_mapping(data: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    secret_keys = {
+        "password",
+        "passwd",
+        "secret",
+        "database_url",
+        "database_url_query",
+        "database_url_map",
+        "database_url_admin",
+        "geoserver_password",
+        "api_user_token",
+        "api_admin_token",
+        "authorization",
+        "cookie",
+        "set-cookie",
+        "access_token",
+        "refresh_token",
+        "token",
+        "session_secret",
+    }
     for key, value in data.items():
-        lowered = key.lower()
-        if lowered in {"password", "passwd", "secret", "database_url", "geoserver_password"}:
+        lowered = str(key).lower().replace("-", "_")
+        if lowered in secret_keys or lowered.endswith("_token") or lowered.endswith("_password"):
             out[key] = "***"
         else:
             out[key] = mask_value(value)

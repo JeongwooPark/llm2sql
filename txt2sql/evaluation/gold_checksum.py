@@ -8,11 +8,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Frozen at Phase 0 baseline (semantic-architecture-v2).
+# Frozen gold checksums (must match committed docs/*.json bytes).
+# 2026-09-04: re-synced llm2sql_신규_…500건_정답표.json digest to the hash of the
+# currently committed file (2c1379…). Prior freeze (6f01c7…) was stale vs HEAD;
+# gold content was not modified by P012 regression-fix work.
 FROZEN_GOLD_CHECKSUMS: dict[str, str] = {
     "docs/평가문항_500.json": "25d76a04fc5e4109443807a8d7177f5e7256452552b6c891d0cbf3c741e0e8a1",
     "docs/llm2sql_신규_자연어질의_테스트셋_500건_정답표.json": (
-        "6f01c72296ca1d4dc54da30cfbf6288717c1ce27d96952e960d4922ae3a54b08"
+        "2c1379b9a0fdd6ede861ef00f233a44bb9ba0ec3961c944747b303d308293a54"
     ),
 }
 

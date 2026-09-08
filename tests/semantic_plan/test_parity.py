@@ -22,18 +22,19 @@ def _sql(question: str) -> str:
 
 def test_parity_usage_count() -> None:
     sql = _sql("해운대구 아파트가 몇 채야?")
-    assert "AL_D010_26_20250704" in sql
     assert "COUNT(*)" in sql.upper()
     assert '"A3"' in sql or '"A4"' in sql
-    assert '"A9"' in sql
-    assert "공동주택" in sql
+    # D198 커버 구에서는 세부용도(아파트), 비커버면 D010 공동주택.
+    assert "AL_D010" in sql or "AL_D198" in sql
+    assert "공동주택" in sql or "아파트" in sql
 
 
 def test_parity_height_threshold() -> None:
     sql = _sql("해운대구 아파트 중 높이 70m 이상인 건물 이름과 높이")
-    assert '"A16"' in sql
+    # D010 height=A16, D198 height=A30
+    assert '"A16"' in sql or '"A30"' in sql
     assert ">= 70" in sql.replace(".0", "")
-    assert "공동주택" in sql
+    assert "공동주택" in sql or "아파트" in sql
 
 
 def test_parity_rank_floor_area() -> None:

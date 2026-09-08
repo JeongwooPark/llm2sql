@@ -50,10 +50,45 @@ class GeoServerClient:
         )
         return status == 200
 
-    def list_workspace_layers(self) -> list[str]:
+    def list_featuretype_names(self) -> list[str]:
+        """데이터스토어 featureType 목록.
+
+        `/rest/workspaces/.../layers` 는 temp_* 수천 개일 때 타임아웃하므로
+        KorDB 카탈로그·존재 확인은 featuretypes.json 을 쓴다.
+        """
+        if not self.enabled:
+            return []
         status, body = self._request(
             "GET",
-            f"{self.base_url}/rest/workspaces/{self.workspace}/layers",
+            f"{self.base_url}/rest/workspaces/{self.workspace}"
+            f"/datastores/{self.datastore}/featuretypes.json",
+            timeout=max(float(self._timeout), 20.0),
+        )
+        if status != 200:
+            return []
+        try:
+            data = json.loads(body.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            return []
+        items = (data.get("featureTypes") or {}).get("featureType") or []
+        if isinstance(items, dict):
+            items = [items]
+        names: list[str] = []
+        for item in items:
+            name = str(item.get("name") or "").strip()
+            if name:
+                names.append(name)
+        return names
+
+    def list_workspace_layers(self) -> list[str]:
+        """워크스페이스 레이어명. featuretypes 우선, 실패 시 layers REST."""
+        names = self.list_featuretype_names()
+        if names:
+            return names
+        status, body = self._request(
+            "GET",
+            f"{self.base_url}/rest/workspaces/{self.workspace}/layers.json",
+            timeout=max(float(self._timeout), 20.0),
         )
         if status != 200:
             return []
@@ -64,17 +99,21 @@ class GeoServerClient:
         layers = data.get("layers", {}).get("layer") or []
         if isinstance(layers, dict):
             layers = [layers]
-        names: list[str] = []
+        out: list[str] = []
         for item in layers:
             name = str(item.get("name") or "")
             if name:
-                names.append(name)
-        return names
+                out.append(name)
+        return out
 
     def catalog_layers(self) -> list[dict[str, Any]]:
-        """KorDB 카탈로그용: 임시 분석 레이어를 제외한 워크스페이스 레이어."""
+        """KorDB 카탈로그용: 임시 분석 레이어를 제외한 워크스페이스 레이어.
+
+        extent는 GeoServer N+1 REST를 피하고 비워 둔다.
+        `/api/map/layers`의 label_catalog_layers가 PostGIS bbox로 채운다.
+        """
         out: list[dict[str, Any]] = []
-        for name in self.list_workspace_layers():
+        for name in self.list_featuretype_names() or self.list_workspace_layers():
             short = name.split(":")[-1]
             if short.startswith(_TEMP_PREFIX):
                 continue
@@ -84,10 +123,22 @@ class GeoServerClient:
                     "qualified": self.qualified_layer(short),
                     "wms_url": self.wms_url(),
                     "wfs_url": self.wfs_url(),
-                    "extent": self.layer_latlon_extent(short) or [],
+                    "extent": [],
                 }
             )
         return out
+
+    def featuretype_exists(self, layer: str) -> bool:
+        short = (layer or "").split(":")[-1]
+        if not short:
+            return False
+        status, _ = self._request(
+            "GET",
+            f"{self.base_url}/rest/workspaces/{self.workspace}"
+            f"/datastores/{self.datastore}/featuretypes/{short}.json",
+            timeout=3,
+        )
+        return status == 200
 
     def layer_latlon_extent(self, layer: str) -> list[float] | None:
         """레이어 lat/lon bbox. 줌에 쓸 EPSG:4326 [minx, miny, maxx, maxy]."""
@@ -208,8 +259,7 @@ class GeoServerClient:
         """레이어가 없으면 만들고, 이미 있으면 성공으로 본다."""
         if self.create_featuretype(table_name, table_name, srs=srs, title=title):
             return True
-        short = {name.split(":")[-1] for name in self.list_workspace_layers()}
-        return table_name in short
+        return self.featuretype_exists(table_name)
 
     def delete_layer(self, layer_name: str) -> bool:
         short = layer_name.split(":")[-1]

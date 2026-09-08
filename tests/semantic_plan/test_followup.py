@@ -105,8 +105,8 @@ def test_event_log_four_turn_and_undo() -> None:
     undone = apply_followup_history("직전 취소", base, events3)
     assert undone is not None
     plan4, events4 = undone
-    assert plan4.query_kind == "count"
-    assert plan4.limit is None
+    assert plan4.query_kind == "rank"
+    assert plan4.limit == 20
     assert len(events4) == len(events3) - 1
 
     reset = apply_followup_history("처음부터", base, events4)

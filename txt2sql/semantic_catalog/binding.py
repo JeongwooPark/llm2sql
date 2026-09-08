@@ -109,7 +109,12 @@ def bind_concept(token: str, *, prefer_dataset: str | None = None) -> SemanticBi
     )
 
 
-def bind_concepts(tokens: list[str], *, require_same_grain: bool = True) -> BindingResult:
+def bind_concepts(
+    tokens: list[str],
+    *,
+    require_same_grain: bool = True,
+    question: str = "",
+) -> BindingResult:
     result = BindingResult()
     chosen: list[SemanticBinding] = []
     for token in tokens:
@@ -132,9 +137,13 @@ def bind_concepts(tokens: list[str], *, require_same_grain: bool = True) -> Bind
                     "permit_date",
                     "building_age_years",
                 }
-                # usage on D198 dong scalars only — not bare usage on D010 counts/lists
+                # bare usage: same central grain policy as dataset_grain (MAIN485).
                 if "usage" in tokens and "detail_usage" not in tokens:
-                    prefer_d198 = False
+                    from txt2sql.dataset_grain import needs_d198_building_grain
+
+                    prefer_d198 = bool(question) and needs_d198_building_grain(
+                        question
+                    )
                 else:
                     prefer_d198 = any(t in d198_tokens for t in tokens)
                 if prefer_d198 or ("usage" in tokens and "height_m" in tokens):

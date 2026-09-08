@@ -99,8 +99,10 @@ def test_case_f_profile_does_not_execute_rank_projection() -> None:
     contract = extract_contract(q)
     assert is_profile_question(q)
     assert not fully_supports(PROFILE, contract)
-    assert select_execution_path(q) != "building_profile"
-    assert select_execution_path(q) == "semantic_plan"
+    path = select_execution_path(q)
+    assert path != "building_profile"
+    # D198 커버 시 attr rank 라우트, 아니면 SQP.
+    assert path in {"semantic_plan", "d198_attr_rank"}
     plan = try_heuristic_plan(q, contract=contract)
     assert plan is not None
     assert "name" in plan.select

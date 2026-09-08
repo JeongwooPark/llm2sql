@@ -34,6 +34,22 @@ def postgis_function(operator: str) -> str | None:
     return POSTGIS_OPERATOR_MAP.get(operator.upper())
 
 
+def datasets_with_spatial() -> list[str]:
+    """Dataset ids that expose geometry for spatial joins."""
+    from txt2sql.semantic_catalog.datasets import DATASETS
+
+    return sorted(
+        ds_id for ds_id, ds in DATASETS.items() if getattr(ds, "supports_spatial", False)
+    )
+
+
+def spatial_supported(dataset_id: str) -> bool:
+    from txt2sql.semantic_catalog.datasets import DATASETS
+
+    ds = DATASETS.get(dataset_id)
+    return bool(ds and getattr(ds, "supports_spatial", False))
+
+
 def compile_distance_predicate(
     operator: str,
     *,

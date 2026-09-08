@@ -195,6 +195,65 @@ def extract_structure(question: str) -> tuple[str, str] | None:
     return found[0] if found else None
 
 
+def exact_structure_label(question: str, alias: str | None = None) -> str | None:
+    """질문이 공식 '…구조' 표기를 쓰면 A11 equality 값, 아니면 None(짧은 별칭→ILIKE).
+
+    「일반목구조」처럼 복합 수식어+짧은 별칭은 equality로 오인하지 않는다.
+    """
+    compact = (question or "").replace(" ", "")
+    label_alias = alias
+    if label_alias is None:
+        hit = extract_structure(question)
+        if hit is None:
+            return None
+        label_alias = hit[0]
+    candidates: list[str] = []
+    if label_alias.endswith("구조"):
+        candidates.append(label_alias)
+    else:
+        candidates.append(f"{label_alias}구조")
+    compound_prefixes = ("일반", "특수", "기타", "간이", "전통")
+    for label in candidates:
+        idx = compact.find(label)
+        if idx < 0:
+            continue
+        if any(
+            idx >= len(prefix) and compact[idx - len(prefix) : idx] == prefix
+            for prefix in compound_prefixes
+        ):
+            return None
+        return label
+    return None
+
+
+def structure_a11_predicate(question: str, alias: str, pattern: str) -> str:
+    """구조 별칭 → A11 SQL 술어 (공식명 equality, 그 외 ILIKE)."""
+    exact = exact_structure_label(question, alias)
+    if exact:
+        safe = exact.replace("'", "''")
+        return f"\"A11\" = '{safe}'"
+    safe_pat = pattern.replace("'", "''")
+    return f"\"A11\" ILIKE '{safe_pat}'"
+
+
+def is_permit_lag_assumption(item: str) -> bool:
+    """허가↔승인 시차 assumption 토큰 여부."""
+    return (
+        item.startswith("permit_day_gap_")
+        or item.startswith("permit_year_gap:")
+        or item.startswith("order_by_day_gap:")
+        or item
+        in {
+            "permit_after_approval",
+            "permit_approval_year_neq",
+        }
+    )
+
+
+def assumptions_include_permit_lag(assumptions: list[str] | None) -> bool:
+    return any(is_permit_lag_assumption(a) for a in (assumptions or []))
+
+
 def extract_structures(question: str) -> list[tuple[str, str]]:
     """질문에 등장하는 구조 표현을 긴 별칭 우선·비중첩으로 모은다."""
     q = question or ""
@@ -284,6 +343,8 @@ AGE_HINTS = (
     "건축년",
     "건축 년",
     "건축년수",
+    "건축연령",
+    "건축 연령",
     "준공",
     "준공일",
     "사용승인",
@@ -297,6 +358,9 @@ AGE_HINTS = (
     "년이 넘",
     "년된",
     "년 된",
+    "년 이상",
+    "년이상",
+    "년 이하",
     "년 미만",
     "년미만",
     "오래된",
@@ -821,6 +885,10 @@ def extract_building_name_candidate(question: str) -> str | None:
         text = text.replace(gu, " ")
     for alias in sorted(USAGE_ALIASES, key=len, reverse=True):
         text = _replace_hangul_word(text, alias)
+    for alias in sorted(DETAIL_USAGE_ALIASES, key=len, reverse=True):
+        text = _replace_hangul_word(text, alias)
+    for alias in sorted(USAGE_CLASS_ALIASES, key=len, reverse=True):
+        text = _replace_hangul_word(text, alias)
     for phrase in sorted(_NAME_STRIP_PHRASES, key=len, reverse=True):
         text = text.replace(phrase, " ")
     text = re.sub(r"[0-9a-zA-Z_\"'.,?？!！()[\]{}]+", " ", text)
@@ -900,12 +968,47 @@ def looks_like_building_name_lookup(question: str) -> bool:
             "사용가능",
             "테이블",
             "컬럼",
+            "칼럼",
             "스키마",
             "속성 설명",
+            "속성데이터",
+            "속성 데이터",
+            "필드목록",
+            "필드 목록",
+        )
+    ):
+        return False
+    # 「…속성데이터는?」처럼 스키마 나열은 건물명 조회가 아님
+    if "속성" in q and any(k in q for k in ("데이터", "컬럼", "칼럼", "필드", "스키마")):
+        return False
+    # 업로드/표시명형 데이터셋 제목(밑줄·고유 토큰)은 건물명 조회가 아님
+    if "_" in q and any(
+        k in q
+        for k in (
+            "행정동",
+            "용지",
+            "면적",
+            "정보",
+            "구역",
+            "단지",
+            "시가화",
+            "활동인구",
         )
     ):
         return False
     if looks_like_measure_threshold(q):
+        return False
+    # 세부용도·용도분류 목록은 건물명 조회가 아님
+    if extract_detail_usages(q) or extract_usage_classes(q):
+        if any(
+            k in q
+            for k in ("건물명", "지번", "보여", "찾아", "목록", "중 연면적", "중 높이")
+        ):
+            return False
+    # 경과년수·용도분류는 건물명 조회가 아님
+    if looks_like_age_question(q):
+        return False
+    if extract_usage_classes(q):
         return False
     if extract_calendar_year(q) is not None and any(
         k in q for k in ("지어", "준공", "사용승인", "이후", "이전", "이래", "까지")
@@ -1263,14 +1366,42 @@ def d198_table_for_gu(gu: str | None) -> str | None:
     return D198_BY_GU.get(gu)
 
 
+def is_permit_approval_lag_question(question: str) -> bool:
+    """허가↔사용승인/준공 시차(걸린 기간·일수) 질의 — 건축 경과년수와 구분."""
+    q = question or ""
+    if "허가" not in q:
+        return False
+    if not any(k in q for k in ("사용승인", "준공")):
+        return False
+    return any(
+        k in q
+        for k in (
+            "걸린",
+            "허가 후",
+            "허가일부터",
+            "허가일에서",
+            "허가일이",
+            "허가연",
+            "일수",
+            "이내 준공",
+            "기간",
+        )
+    )
+
+
 def looks_like_age_question(question: str) -> bool:
     q = question or ""
+    # 허가→승인 시차는 건축연령(경과년수) 라우트 대상이 아님
+    if is_permit_approval_lag_question(q):
+        return False
     if any(k in q for k in ("NULL", "null", "없는", "비어", "결측", "누락")):
         if any(k in q for k in ("사용승인일", "허가일", "준공일")) and not any(
             k in q
             for k in ("년", "오래", "최근", "이상", "이내", "미만", "넘", "경과", "된 지")
         ):
             return False
+    if extract_age_years(q) is not None:
+        return True
     return any(k in q for k in AGE_HINTS)
 
 
@@ -1326,12 +1457,18 @@ def extract_age_years(question: str) -> int | None:
     """'30년 넘은', '10년 미만', '건축 20년' 등에서 연수 추출.
 
     1900~2100은 달력 연도('2020년 이후')로 보고 경과년수에서 제외한다.
+    'N년 이상 걸린'(허가→승인 시차)도 경과년수에서 제외한다.
     """
     if extract_calendar_year(question) is not None:
+        return None
+    if is_permit_approval_lag_question(question):
         return None
     if re.search(r"\d+\s*년\s*(단위|간격|별|씩)", question):
         return None
     if re.search(r"[가-힣]+\s*년\s*(단위|간격|별|씩)", question):
+        return None
+    # 「N년 이상 걸린」은 시차 — 건축연령 연수로 쓰지 않음
+    if re.search(r"\d+\s*년\s*(?:이\s*)?(?:이상|초과|넘)\s*걸린", question):
         return None
     m = re.search(
         r"(\d+)\s*년\s*(?:이\s*)?(?:넘|이상|이하|미만|초과|이내|된|지남|경과)?",
@@ -1346,13 +1483,16 @@ def extract_age_compare(question: str) -> str:
     """경과년수 비교 방향.
 
     - lt: N년 미만 (더 최근) → 사용승인일 > today-N
-    - lte: N년 이하
+    - lte: N년 이하 / 최근 N년(내) → 사용승인일 >= today-N
     - gt: N년 초과
     - gte: N년 이상/넘는 (기본)
     """
     if re.search(r"\d+\s*년\s*(?:이\s*)?미만", question) or "채 안" in question:
         return "lt"
-    if re.search(r"\d+\s*년\s*(?:이\s*)?이내", question):
+    # 최근 N년 / N년 내 / N년 이내 → 최근 구간
+    if re.search(r"최근\s*\d+\s*년", question):
+        return "lte"
+    if re.search(r"\d+\s*년\s*(?:이\s*)?(?:이내|내)", question):
         return "lte"
     if re.search(r"\d+\s*년\s*(?:이\s*)?이하", question):
         return "lte"
@@ -1379,6 +1519,7 @@ def is_busan_wide(question: str) -> bool:
             "부산광역시에서",
             "부산시에",
             "부산에",
+            "부산만",
             "부산 ",
         )
     ) or question.strip().startswith("부산")
