@@ -985,5 +985,5 @@ SQL 생성 시스템 프롬프트의 하드 제약: 한글 테이블명 금지, 
 - `llm2sql/docs/작동방식_및_알고리즘.md` — 0.3.3 시나리오 설명
 - `llm2sql/docs/Semantic_Query_Plan_구현.md` — SQP 명세 (기본 `hybrid`)
 - `llm2sql/README.md` — 사용·파이프라인 요약 (버전 **0.3.3**, SQP v1.1)
-- `llm2sql/docs/20260908_txt2sql_v0.3.3.md` — 0.3.3 PlaceScope·Contract·repair
+- `llm2sql/docs/20260908_txt2sql_v0.3.3.md` — 0.3.3 MAIN485 P0–P2 회복
 - `llm2sql/docs/20260825_txt2sql_v0.3.0.md` — 0.3.0 데이터·지도 변경
